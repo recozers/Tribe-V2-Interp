@@ -9,11 +9,12 @@ Finds the video input that maximally activates a target cortical region
          └──────────────────── backprop ◄───────────────────────────────────────┘
 
 Algorithm (after Olah et al., "Feature Visualization", Distill 2017):
-  1. Start with 64 random noise frames at 256×256, requires_grad=True
+  1. Start with 64 random noise frames at 256×256, optimize their Fourier
+     coefficients instead of pixels directly
   2. Each step: random jitter → ImageNet normalize → V-JEPA 2 → extract
      layer features → zero text/audio → TRIBE v2 transformer → cortical preds
-  3. Loss = −mean(target region activation) + λ_tv · total_variation(frames)
-  4. Backprop to frames, Adam step, clamp pixels to [0, 1]
+  3. Loss = −mean(target region activation) + λ_fft · spectral_penalty(coeffs)
+  4. Backprop to Fourier coefficients, reconstruct frames with inverse FFT
 
 Usage:
     modal run feature_viz.py                              # default V1
@@ -302,15 +303,28 @@ def feature_viz(
              .reshape(1, 1, 3, 1, 1))
 
     # ==================================================================
-    # Helper: total-variation loss
+    # Helper: Fourier parameterization + spectral regularization
     # ==================================================================
 
-    def tv_loss(frames):
-        """Spatial total-variation (squared L2).
-        frames: (1, 64, 3, 256, 256) in [0, 1]."""
-        dh = (frames[:, :, :, 1:, :] - frames[:, :, :, :-1, :]).pow(2).mean()
-        dw = (frames[:, :, :, :, 1:] - frames[:, :, :, :, :-1]).pow(2).mean()
-        return dh + dw
+    fy = torch.fft.fftfreq(FRAME_SIZE, device=device, dtype=torch.float32)
+    fx = torch.fft.rfftfreq(FRAME_SIZE, device=device, dtype=torch.float32)
+    freq_radius = torch.sqrt(fy[:, None].pow(2) + fx[None, :].pow(2))
+    freq_weights = (freq_radius / freq_radius.max()).pow(2)
+    freq_weights = freq_weights.reshape(1, 1, 1, FRAME_SIZE, FRAME_SIZE // 2 + 1)
+
+    def frames_from_spectrum(spectrum_params):
+        """Inverse FFT parameterization returning frames in [0, 1]."""
+        spectrum = torch.view_as_complex(spectrum_params)
+        logits = torch.fft.irfft2(
+            spectrum, s=(FRAME_SIZE, FRAME_SIZE), norm="ortho",
+        )
+        return torch.sigmoid(logits)
+
+    def spectral_penalty(spectrum_params):
+        """Penalize high-frequency Fourier energy of the optimized logits."""
+        spectrum = torch.view_as_complex(spectrum_params)
+        power = spectrum.abs().pow(2)
+        return (freq_weights * power).mean()
 
     # ==================================================================
     # Helper: full differentiable forward pass
@@ -366,23 +380,28 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    def run_optim(n_steps, lam_tv, run_seed, run_dir):
+    def run_optim(n_steps, lam_fft, run_seed, run_dir):
         """One optimization run.  Returns (final_frames, loss_list)."""
         run_dir.mkdir(parents=True, exist_ok=True)
         torch.manual_seed(run_seed)
         random.seed(run_seed)
 
-        # Random noise in [0, 1]
-        frames = torch.rand(
+        # Initialize from random frames, but optimize their Fourier coefficients.
+        init_frames = torch.rand(
             1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE,
             device=device, dtype=torch.float32,
-        ).requires_grad_(True)
+        )
+        init_logits = torch.logit(init_frames.clamp(1e-4, 1 - 1e-4))
+        spectrum_params = torch.view_as_real(
+            torch.fft.rfft2(init_logits, norm="ortho")
+        ).detach().clone().requires_grad_(True)
 
-        opt = torch.optim.Adam([frames], lr=0.05)
+        opt = torch.optim.Adam([spectrum_params], lr=0.05)
         losses = []
 
         for step in range(n_steps):
             opt.zero_grad()
+            frames = frames_from_spectrum(spectrum_params)
 
             # ── Random jitter (2–8 px translation, reflect-padded) ──
             # F.pad with reflect mode cannot pad only H/W on a 5D tensor, so
@@ -399,35 +418,35 @@ def feature_viz(
             # ── Forward through frozen pipeline ──
             preds = forward_pass(jittered)
 
-            # ── Loss: maximize target activation + TV regularization ──
+            # ── Loss: maximize target activation + Fourier regularization ──
             roi_act = preds[:, roi_verts, :].float().mean()
-            tv = tv_loss(frames)
-            loss = -roi_act + lam_tv * tv
+            freq_reg = spectral_penalty(spectrum_params)
+            loss = -roi_act + lam_fft * freq_reg
 
             loss.backward()
             opt.step()
-
-            # ── Clamp pixels to valid range ──
-            with torch.no_grad():
-                frames.data.clamp_(0, 1)
 
             lv = loss.item()
             losses.append(lv)
 
             if step % 50 == 0 or step == n_steps - 1:
                 print(f"    step {step:4d}  loss={lv:+.4f}  "
-                      f"act={roi_act.item():.4f}  tv={tv.item():.6f}")
+                      f"act={roi_act.item():.4f}  fft={freq_reg.item():.6f}")
 
             if step % 200 == 0:
-                _save_grid(frames, run_dir / f"frames_{step:04d}.png",
+                with torch.no_grad():
+                    frames_vis = frames_from_spectrum(spectrum_params)
+                _save_grid(frames_vis, run_dir / f"frames_{step:04d}.png",
                            f"step {step}")
 
         # Save final state
-        _save_grid(frames, run_dir / "frames_final.png", "final")
-        _save_losses(losses, run_dir / "loss_curve.png", f"λ_tv = {lam_tv}")
+        with torch.no_grad():
+            final_frames = frames_from_spectrum(spectrum_params)
+        _save_grid(final_frames, run_dir / "frames_final.png", "final")
+        _save_losses(losses, run_dir / "loss_curve.png", f"λ_fft = {lam_fft}")
         weights_vol.commit()
 
-        return frames.detach().clone(), losses
+        return final_frames.detach().clone(), losses
 
     # ==================================================================
     # Helper: visualization
@@ -458,18 +477,18 @@ def feature_viz(
         plt.close(fig)
 
     # ==================================================================
-    # 4. Lambda_tv sweep
+    # 4. Lambda_fft sweep
     # ==================================================================
 
     best_lambda = 1e-3   # fallback if sweep is skipped
 
     if not skip_sweep:
-        print("\n>>> [4a] Lambda_tv sweep <<<")
+        print("\n>>> [4a] Lambda_fft sweep <<<")
         lambdas = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
         final_losses = {}
 
         for lam in lambdas:
-            print(f"\n  ── λ_tv = {lam} ──")
+            print(f"\n  ── λ_fft = {lam} ──")
             sweep_dir = out_root / "sweep" / f"lambda_{lam:.0e}"
             _, losses = run_optim(sweep_steps, lam, seed, sweep_dir)
             final_losses[lam] = losses[-1]
@@ -477,16 +496,16 @@ def feature_viz(
         # Comparison bar chart
         fig, ax = plt.subplots(figsize=(8, 4))
         labels_str = [f"{l:.0e}" for l in lambdas]
-        activations = [-final_losses[l] for l in lambdas]
-        ax.bar(labels_str, activations)
-        ax.set(xlabel="λ_tv", ylabel="Final mean activation (higher = better)",
+        objectives = [-final_losses[l] for l in lambdas]
+        ax.bar(labels_str, objectives)
+        ax.set(xlabel="λ_fft", ylabel="Final objective (higher = better)",
                title="Lambda sweep")
         fig.tight_layout()
         fig.savefig(str(out_root / "sweep" / "comparison.png"), dpi=150)
         plt.close(fig)
 
         best_lambda = min(final_losses, key=final_losses.get)
-        print(f"\n    Best λ_tv = {best_lambda} "
+        print(f"\n    Best λ_fft = {best_lambda} "
               f"(final loss = {final_losses[best_lambda]:.4f})")
         weights_vol.commit()
 
@@ -494,7 +513,7 @@ def feature_viz(
     # 5. Full runs with best lambda
     # ==================================================================
 
-    print(f"\n>>> [4b] Full optimization ──  λ_tv={best_lambda}  "
+    print(f"\n>>> [4b] Full optimization ──  λ_fft={best_lambda}  "
           f"{full_steps} steps × {n_restarts} restarts <<<")
 
     best_loss = float("inf")
@@ -512,7 +531,7 @@ def feature_viz(
 
     # Save overall best result
     _save_grid(best_frames, out_root / "best_frames.png",
-               f"Best result — {target_roi}, λ_tv={best_lambda}")
+               f"Best result — {target_roi}, λ_fft={best_lambda}")
 
     # Save all 64 frames individually
     ind_dir = out_root / "best_individual"
