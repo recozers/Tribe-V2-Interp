@@ -1,2 +1,3 @@
 /.video_deps
 /__pycache__
+.DS_Store
