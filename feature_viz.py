@@ -305,26 +305,84 @@ def feature_viz(
     # ==================================================================
     # Helper: Fourier parameterization + spectral regularization
     # ==================================================================
+    #
+    # Progressive multi-scale: we optimize Fourier coefficients at
+    # increasing resolutions (64 → 128 → 256).  At each stage the
+    # spectrum tensor only covers frequencies up to that resolution,
+    # so coarse structure is found first.  When upscaling, the existing
+    # coefficients are kept and new high-frequency coefficients are
+    # initialized to zero (smooth start).
+    #
+    # V-JEPA 2 always needs 256×256 input, so we zero-pad the spectrum
+    # to full size before IRFFT — mathematically equivalent to a
+    # band-limited image at full resolution.
 
-    fy = torch.fft.fftfreq(FRAME_SIZE, device=device, dtype=torch.float32)
-    fx = torch.fft.rfftfreq(FRAME_SIZE, device=device, dtype=torch.float32)
-    freq_radius = torch.sqrt(fy[:, None].pow(2) + fx[None, :].pow(2))
-    freq_weights = (freq_radius / freq_radius.max()).pow(2)
-    freq_weights = freq_weights.reshape(1, 1, 1, FRAME_SIZE, FRAME_SIZE // 2 + 1)
+    # Color decorrelation matrix (from Lucid / Olah et al.).
+    # Natural images have highly correlated R/G/B channels.  This matrix
+    # is the SVD square-root of ImageNet's pixel covariance — multiplying
+    # by it maps from an *uncorrelated* 3-channel space to natural RGB,
+    # so the optimizer can move each decorrelated channel independently
+    # without producing rainbow noise.
+    color_corr = torch.tensor(
+        [[0.26, 0.09, 0.02],
+         [0.27, 0.00, -0.05],
+         [0.27, -0.09, 0.03]],
+        device=device, dtype=torch.float32,
+    )
+    # Normalize so max column norm = 1 (keeps sigmoid range reasonable)
+    color_corr = color_corr / color_corr.norm(dim=0, keepdim=True).max()
 
     def frames_from_spectrum(spectrum_params):
-        """Inverse FFT parameterization returning frames in [0, 1]."""
+        """Inverse FFT → color decorrelation → sigmoid → frames in [0, 1].
+
+        spectrum_params may be smaller than full resolution (progressive
+        multi-scale).  We zero-pad to 256×256 before IRFFT so V-JEPA 2
+        always gets the resolution it expects.
+        """
         spectrum = torch.view_as_complex(spectrum_params)
+        # spectrum shape: (1, 64, 3, cur_h, cur_w_rfft)
+        cur_h, cur_w_rfft = spectrum.shape[-2], spectrum.shape[-1]
+        full_w_rfft = FRAME_SIZE // 2 + 1  # 129
+
+        # Zero-pad to full resolution if needed
+        if cur_h < FRAME_SIZE or cur_w_rfft < full_w_rfft:
+            full = torch.zeros(
+                1, NUM_FRAMES, 3, FRAME_SIZE, full_w_rfft,
+                dtype=spectrum.dtype, device=spectrum.device,
+            )
+            # Place low-frequency coefficients: positive freqs at top,
+            # negative freqs at bottom (standard FFT layout)
+            pos_h = (cur_h + 1) // 2   # positive frequency rows
+            neg_h = cur_h // 2          # negative frequency rows
+            full[:, :, :, :pos_h, :cur_w_rfft] = spectrum[:, :, :, :pos_h, :]
+            if neg_h > 0:
+                full[:, :, :, -neg_h:, :cur_w_rfft] = spectrum[:, :, :, -neg_h:, :]
+            spectrum = full
+
         logits = torch.fft.irfft2(
             spectrum, s=(FRAME_SIZE, FRAME_SIZE), norm="ortho",
         )
+        # Apply color correlation: einsum over channel dim
+        logits = torch.einsum("btchw, cd -> btdhw", logits, color_corr)
         return torch.sigmoid(logits)
 
     def spectral_penalty(spectrum_params):
-        """Penalize high-frequency Fourier energy of the optimized logits."""
+        """Penalize high-frequency Fourier energy of the optimized coefficients.
+
+        Builds frequency weights on the fly to match the current spectrum
+        resolution (which changes across progressive stages).
+        """
         spectrum = torch.view_as_complex(spectrum_params)
+        cur_h, cur_w_rfft = spectrum.shape[-2], spectrum.shape[-1]
+        fy = torch.fft.fftfreq(cur_h, device=device, dtype=torch.float32)
+        fx = torch.fft.rfftfreq(cur_h * 2 - 1 if cur_w_rfft > 1 else 1,
+                                device=device, dtype=torch.float32)[:cur_w_rfft]
+        freq_r = torch.sqrt(fy[:, None].pow(2) + fx[None, :].pow(2))
+        # Quadratic penalty: higher frequencies penalized more
+        fw = (freq_r / (freq_r.max() + 1e-8)).pow(2)
+        fw = fw.reshape(1, 1, 1, cur_h, cur_w_rfft)
         power = spectrum.abs().pow(2)
-        return (freq_weights * power).mean()
+        return (fw * power).mean()
 
     # ==================================================================
     # Helper: full differentiable forward pass
@@ -380,64 +438,129 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    def run_optim(n_steps, lam_fft, run_seed, run_dir):
-        """One optimization run.  Returns (final_frames, loss_list)."""
-        run_dir.mkdir(parents=True, exist_ok=True)
+    # Progressive resolution stages.  Steps are split proportionally
+    # across stages (more steps at higher res where there's more to refine).
+    STAGES = [
+        # (spatial_res, fraction_of_total_steps)
+        (64,  0.20),   # coarse blobs and dominant orientation
+        (128, 0.30),   # mid-frequency edges and structure
+        (256, 0.50),   # full detail refinement
+    ]
+
+    def _make_init_spectrum(res, run_seed):
+        """Random spectrum at a given spatial resolution."""
         torch.manual_seed(run_seed)
+        w_rfft = res // 2 + 1
+        init = torch.rand(1, NUM_FRAMES, 3, res, res, device=device)
+        logits = torch.logit(init.clamp(1e-4, 1 - 1e-4))
+        return torch.view_as_real(
+            torch.fft.rfft2(logits, norm="ortho")
+        ).detach().clone()   # (1, 64, 3, res, w_rfft, 2)
+
+    def _upsample_spectrum(spectrum_params, new_h):
+        """Embed existing low-res spectrum into a larger tensor.
+
+        New high-frequency coefficients are initialized to zero so the
+        image stays smooth right after upsampling.
+        """
+        old = torch.view_as_complex(spectrum_params.detach().clone())
+        old_h, old_w = old.shape[-2], old.shape[-1]
+        new_w = new_h // 2 + 1
+        full = torch.zeros(
+            1, NUM_FRAMES, 3, new_h, new_w,
+            dtype=old.dtype, device=old.device,
+        )
+        pos_h = (old_h + 1) // 2
+        neg_h = old_h // 2
+        w_copy = min(old_w, new_w)
+        full[:, :, :, :pos_h, :w_copy] = old[:, :, :, :pos_h, :w_copy]
+        if neg_h > 0:
+            full[:, :, :, -neg_h:, :w_copy] = old[:, :, :, -neg_h:, :w_copy]
+        return torch.view_as_real(full).requires_grad_(True)
+
+    def run_optim(n_steps, lam_fft, run_seed, run_dir):
+        """Progressive multi-scale optimization run.
+
+        Optimizes Fourier coefficients at 64 → 128 → 256, spending more
+        steps at higher resolutions.  Returns (final_frames, loss_list).
+        """
+        run_dir.mkdir(parents=True, exist_ok=True)
         random.seed(run_seed)
 
-        # Initialize from random frames, but optimize their Fourier coefficients.
-        init_frames = torch.rand(
-            1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE,
-            device=device, dtype=torch.float32,
-        )
-        init_logits = torch.logit(init_frames.clamp(1e-4, 1 - 1e-4))
-        spectrum_params = torch.view_as_real(
-            torch.fft.rfft2(init_logits, norm="ortho")
-        ).detach().clone().requires_grad_(True)
+        # Temporal smoothness weight — gentle, 10× less than spectral penalty.
+        lam_temporal = lam_fft * 0.1
 
-        opt = torch.optim.Adam([spectrum_params], lr=0.05)
         losses = []
+        global_step = 0
+        spectrum_params = None
 
-        for step in range(n_steps):
-            opt.zero_grad()
-            frames = frames_from_spectrum(spectrum_params)
+        for stage_idx, (res, frac) in enumerate(STAGES):
+            stage_steps = max(1, int(n_steps * frac))
+            w_rfft = res // 2 + 1
+            print(f"      stage {stage_idx}: {res}×{res}  "
+                  f"({stage_steps} steps, spectrum {res}×{w_rfft})")
 
-            # ── Random jitter (2–8 px translation, reflect-padded) ──
-            # F.pad with reflect mode cannot pad only H/W on a 5D tensor, so
-            # flatten batch and time into a 4D image batch first.
-            pad = 8
-            frames_2d = frames.reshape(-1, 3, FRAME_SIZE, FRAME_SIZE)
-            padded = F.pad(frames_2d, [pad] * 4, mode="reflect")
-            padded = padded.reshape(1, NUM_FRAMES, 3,
-                                    FRAME_SIZE + 2 * pad, FRAME_SIZE + 2 * pad)
-            dx = random.randint(0, 2 * pad)
-            dy = random.randint(0, 2 * pad)
-            jittered = padded[..., dy:dy + FRAME_SIZE, dx:dx + FRAME_SIZE]
+            # Initialize or upsample from previous stage
+            if spectrum_params is None:
+                spectrum_params = _make_init_spectrum(res, run_seed)
+                spectrum_params.requires_grad_(True)
+            else:
+                spectrum_params = _upsample_spectrum(spectrum_params, res)
 
-            # ── Forward through frozen pipeline ──
-            preds = forward_pass(jittered)
+            # Fresh optimizer + cosine schedule per stage
+            lr_max = 0.03 if stage_idx == 0 else 0.01
+            lr_min = 0.003 if stage_idx == 0 else 0.001
+            opt = torch.optim.Adam([spectrum_params], lr=lr_max)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=stage_steps, eta_min=lr_min,
+            )
 
-            # ── Loss: maximize target activation + Fourier regularization ──
-            roi_act = preds[:, roi_verts, :].float().mean()
-            freq_reg = spectral_penalty(spectrum_params)
-            loss = -roi_act + lam_fft * freq_reg
+            for step in range(stage_steps):
+                opt.zero_grad()
+                frames = frames_from_spectrum(spectrum_params)
 
-            loss.backward()
-            opt.step()
+                # Random jitter (reflect-padded)
+                pad = 8
+                frames_2d = frames.reshape(-1, 3, FRAME_SIZE, FRAME_SIZE)
+                padded = F.pad(frames_2d, [pad] * 4, mode="reflect")
+                padded = padded.reshape(1, NUM_FRAMES, 3,
+                                        FRAME_SIZE + 2 * pad,
+                                        FRAME_SIZE + 2 * pad)
+                dx = random.randint(0, 2 * pad)
+                dy = random.randint(0, 2 * pad)
+                jittered = padded[..., dy:dy + FRAME_SIZE, dx:dx + FRAME_SIZE]
 
-            lv = loss.item()
-            losses.append(lv)
+                # Forward through frozen pipeline
+                preds = forward_pass(jittered)
 
-            if step % 50 == 0 or step == n_steps - 1:
-                print(f"    step {step:4d}  loss={lv:+.4f}  "
-                      f"act={roi_act.item():.4f}  fft={freq_reg.item():.6f}")
+                # Loss
+                roi_act = preds[:, roi_verts, :].float().mean()
+                freq_reg = spectral_penalty(spectrum_params)
+                temporal_reg = (frames[:, 1:] - frames[:, :-1]).pow(2).mean()
+                loss = -roi_act + lam_fft * freq_reg + lam_temporal * temporal_reg
 
-            if step % 200 == 0:
-                with torch.no_grad():
-                    frames_vis = frames_from_spectrum(spectrum_params)
-                _save_grid(frames_vis, run_dir / f"frames_{step:04d}.png",
-                           f"step {step}")
+                loss.backward()
+                opt.step()
+                scheduler.step()
+
+                lv = loss.item()
+                losses.append(lv)
+
+                if global_step % 50 == 0 or (stage_idx == len(STAGES) - 1
+                                              and step == stage_steps - 1):
+                    cur_lr = scheduler.get_last_lr()[0]
+                    print(f"    step {global_step:4d}  loss={lv:+.4f}  "
+                          f"act={roi_act.item():.4f}  fft={freq_reg.item():.4f}  "
+                          f"temp={temporal_reg.item():.4f}  lr={cur_lr:.4f}")
+
+                if global_step % 200 == 0:
+                    with torch.no_grad():
+                        frames_vis = frames_from_spectrum(spectrum_params)
+                    _save_grid(frames_vis,
+                               run_dir / f"frames_{global_step:04d}.png",
+                               f"step {global_step} ({res}×{res})")
+
+                global_step += 1
 
         # Save final state
         with torch.no_grad():
@@ -545,6 +668,136 @@ def feature_viz(
                     dpi=100, bbox_inches="tight")
         plt.close(fig)
 
+    # ==================================================================
+    # 6. Validation — selectivity check + random baseline
+    # ==================================================================
+    #
+    # Key question: is the optimized stimulus *selective* for the target
+    # ROI, or does it just produce high activation everywhere?
+    #
+    # We measure mean predicted activation for every ROI in ROI_MAP,
+    # for three conditions:
+    #   (a) the optimized frames (best restart)
+    #   (b) random noise frames (baseline)
+    #   (c) anti-optimized: what the start looked like (random init)
+    #
+    # A good result: the target ROI bar is tall for optimized, and
+    # similar to random for non-target ROIs.
+
+    print("\n>>> [5/5] Validation — selectivity & baseline <<<")
+
+    # Build vertex indices for all ROIs using the already-downloaded annots
+    all_roi_verts = {}
+    for roi_name, roi_labels in ROI_MAP.items():
+        verts = []
+        for hemi_prefix, offset in [("lh", 0), ("rh", FSAVERAGE5_VERTS)]:
+            annot_path = (subjects_dir / "fsaverage" / "label"
+                          / f"{hemi_prefix}.HCPMMP1.annot")
+            labels_arr, ctab, names = nbfs.read_annot(str(annot_path))
+            for i, name_bytes in enumerate(names):
+                name = (name_bytes.decode("utf-8")
+                        if isinstance(name_bytes, bytes) else str(name_bytes))
+                clean = name
+                if clean.startswith(("L_", "R_")):
+                    clean = clean[2:]
+                clean = clean.replace("_ROI", "")
+                if clean.endswith(("-lh", "-rh")):
+                    clean = clean[:-3]
+                if clean in roi_labels:
+                    v = np.where(labels_arr == i)[0]
+                    v = v[v < FSAVERAGE5_VERTS]
+                    verts.extend(v + offset)
+        all_roi_verts[roi_name] = torch.tensor(
+            sorted(set(verts)), dtype=torch.long, device=device,
+        )
+    print(f"    ROIs indexed: {', '.join(f'{k}({len(v)})' for k, v in all_roi_verts.items())}")
+
+    # Measure activation for optimized frames and random baseline
+    def measure_all_rois(frames_input):
+        """Forward pass, return {roi_name: mean_activation} dict."""
+        with torch.no_grad():
+            preds = forward_pass(frames_input)  # (1, n_verts, n_t)
+        return {
+            name: preds[:, vidx, :].float().mean().item()
+            for name, vidx in all_roi_verts.items()
+            if len(vidx) > 0
+        }
+
+    # Optimized stimulus
+    act_optimized = measure_all_rois(best_frames)
+    print(f"    Optimized:  {act_optimized}")
+
+    # Random baseline (average over a few seeds for stability)
+    random_acts = []
+    for rs in range(5):
+        torch.manual_seed(seed + 9000 + rs)
+        rand_frames = torch.rand(
+            1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE,
+            device=device, dtype=torch.float32,
+        )
+        random_acts.append(measure_all_rois(rand_frames))
+    act_random = {
+        name: np.mean([ra[name] for ra in random_acts])
+        for name in random_acts[0]
+    }
+    act_random_std = {
+        name: np.std([ra[name] for ra in random_acts])
+        for name in random_acts[0]
+    }
+    print(f"    Random:     {act_random}")
+
+    # ── Selectivity bar chart ──
+    roi_names = list(all_roi_verts.keys())
+    x = np.arange(len(roi_names))
+    width = 0.35
+
+    opt_vals = [act_optimized.get(r, 0) for r in roi_names]
+    rnd_vals = [act_random.get(r, 0) for r in roi_names]
+    rnd_errs = [act_random_std.get(r, 0) for r in roi_names]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars_opt = ax.bar(x - width / 2, opt_vals, width, label="Optimized")
+    bars_rnd = ax.bar(x + width / 2, rnd_vals, width, yerr=rnd_errs,
+                      capsize=3, label="Random (5 seeds)")
+
+    # Highlight the target ROI
+    for i, name in enumerate(roi_names):
+        if name == target_roi:
+            bars_opt[i].set_edgecolor("red")
+            bars_opt[i].set_linewidth(2.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(roi_names, fontsize=11)
+    ax.set_ylabel("Mean predicted activation")
+    ax.set_title(f"Selectivity check — optimized for {target_roi}")
+    ax.legend()
+    ax.grid(True, alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(str(out_root / "selectivity.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Summary stats ──
+    target_opt = act_optimized.get(target_roi, 0)
+    target_rnd = act_random.get(target_roi, 0)
+    other_opt = [act_optimized[r] for r in roi_names if r != target_roi]
+    selectivity_ratio = target_opt / (np.mean(other_opt) + 1e-8) if other_opt else float("nan")
+
+    summary = {
+        "target_roi": target_roi,
+        "target_activation_optimized": target_opt,
+        "target_activation_random": target_rnd,
+        "lift_over_random": target_opt - target_rnd,
+        "selectivity_ratio": selectivity_ratio,
+        "all_rois_optimized": act_optimized,
+        "all_rois_random": act_random,
+    }
+    import json
+    with open(out_root / "validation.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n    Lift over random:   {target_opt - target_rnd:+.4f}")
+    print(f"    Selectivity ratio:  {selectivity_ratio:.2f}× "
+          f"(target / mean other ROIs)")
+
     weights_vol.commit()
 
     print(f"\n{'='*60}")
@@ -554,6 +807,8 @@ def feature_viz(
     print(f"    → outputs/{target_roi}/full/          (5 restarts)")
     print(f"    → outputs/{target_roi}/best_frames.png")
     print(f"    → outputs/{target_roi}/best_individual/")
+    print(f"    → outputs/{target_roi}/selectivity.png")
+    print(f"    → outputs/{target_roi}/validation.json")
     print(f"{'='*60}")
 
 
@@ -566,7 +821,7 @@ def main(
     target_roi: str = "V1",
     skip_sweep: bool = False,
     sweep_steps: int = 500,
-    full_steps: int = 2000,
+    full_steps: int = 3000,
     n_restarts: int = 5,
     seed: int = 42,
 ):
