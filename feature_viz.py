@@ -480,7 +480,7 @@ def feature_viz(
     # 4. Lambda_fft sweep
     # ==================================================================
 
-    best_lambda = 1e-3   # fallback if sweep is skipped
+    best_lambda = 1e-4   # fallback if sweep is skipped
 
     if not skip_sweep:
         print("\n>>> [4a] Lambda_fft sweep <<<")
