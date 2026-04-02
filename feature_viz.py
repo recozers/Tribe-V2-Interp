@@ -117,6 +117,7 @@ def feature_viz(
     full_steps: int = 2000,
     n_restarts: int = 5,
     seed: int = 42,
+    single_frame: bool = False,
 ):
     import random
     from pathlib import Path
@@ -332,22 +333,30 @@ def feature_viz(
     # Normalize so max column norm = 1 (keeps sigmoid range reasonable)
     color_corr = color_corr / color_corr.norm(dim=0, keepdim=True).max()
 
+    # How many temporal frames to optimize (1 if single_frame, 64 otherwise).
+    # In single_frame mode we optimize one frame and tile it to 64 before
+    # feeding V-JEPA 2, so all optimization budget goes into spatial structure.
+    n_opt_frames = 1 if single_frame else NUM_FRAMES
+
     def frames_from_spectrum(spectrum_params):
         """Inverse FFT → color decorrelation → sigmoid → frames in [0, 1].
 
         spectrum_params may be smaller than full resolution (progressive
         multi-scale).  We zero-pad to 256×256 before IRFFT so V-JEPA 2
         always gets the resolution it expects.
+
+        In single_frame mode, spectrum_params has temporal dim 1 and the
+        result is tiled to 64 frames.
         """
         spectrum = torch.view_as_complex(spectrum_params)
-        # spectrum shape: (1, 64, 3, cur_h, cur_w_rfft)
+        # spectrum shape: (1, n_opt_frames, 3, cur_h, cur_w_rfft)
         cur_h, cur_w_rfft = spectrum.shape[-2], spectrum.shape[-1]
         full_w_rfft = FRAME_SIZE // 2 + 1  # 129
 
         # Zero-pad to full resolution if needed
         if cur_h < FRAME_SIZE or cur_w_rfft < full_w_rfft:
             full = torch.zeros(
-                1, NUM_FRAMES, 3, FRAME_SIZE, full_w_rfft,
+                1, n_opt_frames, 3, FRAME_SIZE, full_w_rfft,
                 dtype=spectrum.dtype, device=spectrum.device,
             )
             # Place low-frequency coefficients: positive freqs at top,
@@ -364,7 +373,12 @@ def feature_viz(
         )
         # Apply color correlation: einsum over channel dim
         logits = torch.einsum("btchw, cd -> btdhw", logits, color_corr)
-        return torch.sigmoid(logits)
+        frames = torch.sigmoid(logits)
+
+        # Tile single frame to 64 for V-JEPA 2
+        if single_frame:
+            frames = frames.expand(1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE)
+        return frames
 
     def spectral_penalty(spectrum_params):
         """Penalize high-frequency Fourier energy of the optimized coefficients.
@@ -451,11 +465,11 @@ def feature_viz(
         """Random spectrum at a given spatial resolution."""
         torch.manual_seed(run_seed)
         w_rfft = res // 2 + 1
-        init = torch.rand(1, NUM_FRAMES, 3, res, res, device=device)
+        init = torch.rand(1, n_opt_frames, 3, res, res, device=device)
         logits = torch.logit(init.clamp(1e-4, 1 - 1e-4))
         return torch.view_as_real(
             torch.fft.rfft2(logits, norm="ortho")
-        ).detach().clone()   # (1, 64, 3, res, w_rfft, 2)
+        ).detach().clone()   # (1, n_opt_frames, 3, res, w_rfft, 2)
 
     def _upsample_spectrum(spectrum_params, new_h):
         """Embed existing low-res spectrum into a larger tensor.
@@ -467,7 +481,7 @@ def feature_viz(
         old_h, old_w = old.shape[-2], old.shape[-1]
         new_w = new_h // 2 + 1
         full = torch.zeros(
-            1, NUM_FRAMES, 3, new_h, new_w,
+            1, n_opt_frames, 3, new_h, new_w,
             dtype=old.dtype, device=old.device,
         )
         pos_h = (old_h + 1) // 2
@@ -536,8 +550,13 @@ def feature_viz(
                 # Loss
                 roi_act = preds[:, roi_verts, :].float().mean()
                 freq_reg = spectral_penalty(spectrum_params)
-                temporal_reg = (frames[:, 1:] - frames[:, :-1]).pow(2).mean()
-                loss = -roi_act + lam_fft * freq_reg + lam_temporal * temporal_reg
+                loss = -roi_act + lam_fft * freq_reg
+                # Temporal smoothness only when optimizing multiple frames
+                if not single_frame:
+                    temporal_reg = (frames[:, 1:] - frames[:, :-1]).pow(2).mean()
+                    loss = loss + lam_temporal * temporal_reg
+                else:
+                    temporal_reg = torch.tensor(0.0)
 
                 loss.backward()
                 opt.step()
@@ -576,16 +595,25 @@ def feature_viz(
     # ==================================================================
 
     def _save_grid(frames_t, path, title=""):
-        """Save grid of 8 evenly-spaced frames from the 64-frame clip."""
+        """Save grid of frames. Single large image in single_frame mode,
+        8 evenly-spaced frames otherwise."""
         f = frames_t[0].detach().cpu().clamp(0, 1)   # (64, 3, H, W)
-        idxs = np.linspace(0, NUM_FRAMES - 1, 8, dtype=int)
-        fig, axes = plt.subplots(1, 8, figsize=(24, 3))
-        for i, idx in enumerate(idxs):
-            axes[i].imshow(f[idx].permute(1, 2, 0).numpy())
-            axes[i].set_title(f"f{idx}", fontsize=9)
-            axes[i].axis("off")
-        if title:
-            fig.suptitle(title, fontsize=12)
+        if single_frame:
+            # All frames are identical — just show one, bigger
+            fig, ax = plt.subplots(figsize=(6, 6))
+            ax.imshow(f[0].permute(1, 2, 0).numpy())
+            ax.axis("off")
+            if title:
+                ax.set_title(title, fontsize=12)
+        else:
+            idxs = np.linspace(0, NUM_FRAMES - 1, 8, dtype=int)
+            fig, axes = plt.subplots(1, 8, figsize=(24, 3))
+            for i, idx in enumerate(idxs):
+                axes[i].imshow(f[idx].permute(1, 2, 0).numpy())
+                axes[i].set_title(f"f{idx}", fontsize=9)
+                axes[i].axis("off")
+            if title:
+                fig.suptitle(title, fontsize=12)
         fig.tight_layout()
         fig.savefig(str(path), dpi=150, bbox_inches="tight")
         plt.close(fig)
@@ -656,16 +684,17 @@ def feature_viz(
     _save_grid(best_frames, out_root / "best_frames.png",
                f"Best result — {target_roi}, λ_fft={best_lambda}")
 
-    # Save all 64 frames individually
+    # Save frames individually
     ind_dir = out_root / "best_individual"
     ind_dir.mkdir(exist_ok=True)
     bf = best_frames[0].cpu().clamp(0, 1)
-    for i in range(NUM_FRAMES):
-        fig, ax = plt.subplots(figsize=(3, 3))
+    n_save = 1 if single_frame else NUM_FRAMES
+    for i in range(n_save):
+        fig, ax = plt.subplots(figsize=(6, 6) if single_frame else (3, 3))
         ax.imshow(bf[i].permute(1, 2, 0).numpy())
         ax.axis("off")
         fig.savefig(str(ind_dir / f"frame_{i:02d}.png"),
-                    dpi=100, bbox_inches="tight")
+                    dpi=200 if single_frame else 100, bbox_inches="tight")
         plt.close(fig)
 
     # ==================================================================
@@ -824,6 +853,7 @@ def main(
     full_steps: int = 3000,
     n_restarts: int = 5,
     seed: int = 42,
+    single_frame: bool = False,
 ):
     feature_viz.remote(
         target_roi=target_roi,
@@ -832,4 +862,5 @@ def main(
         full_steps=full_steps,
         n_restarts=n_restarts,
         seed=seed,
+        single_frame=single_frame,
     )
