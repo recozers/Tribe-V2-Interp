@@ -168,6 +168,11 @@ def feature_viz(
     for p in vjepa.parameters():
         p.requires_grad_(False)
 
+    # ── Gradient checkpointing ──
+    # Recompute layer activations during backward instead of storing all
+    # 40 layers.  Trades ~2× compute for ~60-70% activation memory savings.
+    vjepa.gradient_checkpointing_enable()
+
     n_enc_layers = vjepa.config.num_hidden_layers  # 40
     enc_dim = vjepa.config.hidden_size             # 1408
 
@@ -175,12 +180,34 @@ def feature_viz(
     # length num_hidden_layers (no embedding entry).  hidden_states[i]
     # is the output of encoder layer i.  Clamp to valid range.
     layer_indices = [
-        min(int(0.5 * n_enc_layers), n_enc_layers - 1),    # 20 → clamped ok
-        min(int(0.75 * n_enc_layers), n_enc_layers - 1),   # 30 → clamped ok
-        n_enc_layers - 1,                                    # 39 (last layer)
+        min(int(0.5 * n_enc_layers), n_enc_layers - 1),    # 20
+        min(int(0.75 * n_enc_layers), n_enc_layers - 1),   # 30
+        n_enc_layers - 1,                                    # 39
     ]
+
+    # ── Selective layer hooks ──
+    # Instead of output_hidden_states=True (which stores all 40 layers,
+    # ~1.8 GB), we register forward hooks on only the 3 layers we need.
+    # This avoids holding the other 37 in memory.
+    _captured_hiddens = {}
+
+    def _make_hook(layer_idx):
+        def hook(module, input, output):
+            # VJEPA2Layer returns (hidden_states, attn_weights)
+            h = output[0] if isinstance(output, tuple) else output
+            _captured_hiddens[layer_idx] = h
+        return hook
+
+    # Resolve layer modules and attach hooks.
+    # V-JEPA 2 encoder layers live at vjepa.encoder.layer[i]
+    encoder_layers = vjepa.encoder.layer
+    hook_handles = []
+    for li in layer_indices:
+        handle = encoder_layers[li].register_forward_hook(_make_hook(li))
+        hook_handles.append(handle)
+
     print(f"    {n_enc_layers} layers, dim={enc_dim}, "
-          f"extracting at {layer_indices}")
+          f"hooks on layers {layer_indices}")
     weights_vol.commit()
 
     # ==================================================================
@@ -227,6 +254,12 @@ def feature_viz(
             for f in np.linspace(0.5, 1.0, vid_n_layers)
         ]
         print(f"    adjusted layer_indices → {layer_indices}")
+
+    # Log VRAM after model loading
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    print(f"    VRAM after model load: {alloc:.1f} GB allocated, "
+          f"{reserved:.1f} GB reserved")
     weights_vol.commit()
 
     # ==================================================================
@@ -414,25 +447,33 @@ def feature_viz(
 
         Pipeline:
           1. ImageNet-normalize
-          2. V-JEPA 2 forward → hidden states at target layers
+          2. V-JEPA 2 forward (hooks capture 3 target layers only)
           3. Reshape (B, 8192, D) → (B, 32, 256, D) → spatial mean → (B, 32, D)
           4. Stack layers → (B, n_layers, D, 32)  (TRIBE v2 format)
           5. TRIBE v2 forward with only video features (text/audio = zeros)
           6. Returns (1, n_vertices, n_output_timesteps)
+
+        Memory: gradient checkpointing recomputes layer activations during
+        backward.  Forward hooks on 3 target layers capture only what we
+        need (~135 MB) instead of all 40 layers (~1.8 GB).
         """
         normed = (frames - mean_t) / std_t
 
-        # V-JEPA 2 (fp16 via autocast, SDPA for memory-efficient attention)
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            out = vjepa(pixel_values_videos=normed, output_hidden_states=True)
+        # Clear captured states from previous call
+        _captured_hiddens.clear()
 
-        # Extract target-layer hidden states, pool over spatial tokens.
+        # V-JEPA 2 forward — hooks fire on layers 20, 30, 39 and
+        # populate _captured_hiddens.  No output_hidden_states needed.
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            vjepa(pixel_values_videos=normed)
+
+        # Extract hooked hidden states, pool over spatial tokens.
         # V-JEPA 2 Conv3d patch embedding flattens in (T, H, W) order,
         # so the first S_TOKENS=256 entries at each temporal position are
         # the spatial patches for that frame-pair.
         feats = []
         for li in layer_indices:
-            h = out.hidden_states[li]                   # (1, T_tok*S_tok, D)
+            h = _captured_hiddens[li]                   # (1, T_tok*S_tok, D)
             h = h.reshape(1, T_TOKENS, S_TOKENS, -1)   # (1, 32, 256, D)
             h = h.mean(dim=2)                           # (1, 32, D)  — spatial pool
             feats.append(h)
@@ -561,6 +602,13 @@ def feature_viz(
                 loss.backward()
                 opt.step()
                 scheduler.step()
+
+                # Log peak VRAM on first step
+                if global_step == 0:
+                    peak = torch.cuda.max_memory_allocated() / 1e9
+                    cur = torch.cuda.memory_allocated() / 1e9
+                    print(f"    VRAM peak: {peak:.1f} GB  "
+                          f"(current: {cur:.1f} GB)")
 
                 lv = loss.item()
                 losses.append(lv)
