@@ -369,8 +369,6 @@ def feature_viz(
     # How many temporal frames to optimize (1 if single_frame, 64 otherwise).
     # In single_frame mode we optimize one frame and tile it to 64 before
     # feeding V-JEPA 2, so all optimization budget goes into spatial structure.
-    n_opt_frames = 1 if single_frame else NUM_FRAMES
-
     def frames_from_spectrum(spectrum_params):
         """Inverse FFT → color decorrelation → sigmoid → frames in [0, 1].
 
@@ -379,23 +377,23 @@ def feature_viz(
         always gets the resolution it expects.
 
         In single_frame mode, spectrum_params has temporal dim 1 and the
-        result is tiled to 64 frames.
+        result is tiled to 64 frames.  In progressive temporal mode,
+        fewer-than-64 frames are linearly interpolated to 64.
         """
         spectrum = torch.view_as_complex(spectrum_params)
-        # spectrum shape: (1, n_opt_frames, 3, cur_h, cur_w_rfft)
+        # spectrum shape: (1, cur_n_frames, 3, cur_h, cur_w_rfft)
+        cur_n_frames = spectrum.shape[1]
         cur_h, cur_w_rfft = spectrum.shape[-2], spectrum.shape[-1]
         full_w_rfft = FRAME_SIZE // 2 + 1  # 129
 
-        # Zero-pad to full resolution if needed
+        # Zero-pad to full spatial resolution if needed
         if cur_h < FRAME_SIZE or cur_w_rfft < full_w_rfft:
             full = torch.zeros(
-                1, n_opt_frames, 3, FRAME_SIZE, full_w_rfft,
+                1, cur_n_frames, 3, FRAME_SIZE, full_w_rfft,
                 dtype=spectrum.dtype, device=spectrum.device,
             )
-            # Place low-frequency coefficients: positive freqs at top,
-            # negative freqs at bottom (standard FFT layout)
-            pos_h = (cur_h + 1) // 2   # positive frequency rows
-            neg_h = cur_h // 2          # negative frequency rows
+            pos_h = (cur_h + 1) // 2
+            neg_h = cur_h // 2
             full[:, :, :, :pos_h, :cur_w_rfft] = spectrum[:, :, :, :pos_h, :]
             if neg_h > 0:
                 full[:, :, :, -neg_h:, :cur_w_rfft] = spectrum[:, :, :, -neg_h:, :]
@@ -408,9 +406,16 @@ def feature_viz(
         logits = torch.einsum("btchw, cd -> btdhw", logits, color_corr)
         frames = torch.sigmoid(logits)
 
-        # Tile single frame to 64 for V-JEPA 2
+        # Expand to 64 frames for V-JEPA 2
         if single_frame:
             frames = frames.expand(1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE)
+        elif cur_n_frames < NUM_FRAMES:
+            # Interpolate temporal dimension: (1, cur_n, 3, H, W) → (1, 64, 3, H, W)
+            b, t, c, h, w = frames.shape
+            flat = frames.reshape(b, t, c * h * w).permute(0, 2, 1)  # (1, C*H*W, t)
+            up = F.interpolate(flat, size=NUM_FRAMES, mode="linear",
+                               align_corners=True)
+            frames = up.permute(0, 2, 1).reshape(b, NUM_FRAMES, c, h, w)
         return frames
 
     def spectral_penalty(spectrum_params):
@@ -493,36 +498,42 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    # Progressive resolution stages.  Steps are split proportionally
-    # across stages (more steps at higher res where there's more to refine).
+    # Progressive resolution stages: spatial first, then temporal ramp-up.
+    # Early stages use few frames at low spatial res to cheaply establish
+    # structure; later stages add temporal detail at full spatial resolution.
     STAGES = [
-        # (spatial_res, fraction_of_total_steps)
-        (64,  0.20),   # coarse blobs and dominant orientation
-        (128, 0.30),   # mid-frequency edges and structure
-        (256, 0.50),   # full detail refinement
+        # (n_frames, spatial_res, fraction_of_total_steps)
+        (1,  64,  0.08),   # single frame, coarse spatial blobs
+        (1,  128, 0.10),   # single frame, mid-frequency spatial
+        (1,  256, 0.12),   # single frame, full spatial detail
+        (8,  256, 0.15),   # first temporal expansion
+        (16, 256, 0.15),   # more temporal detail
+        (32, 256, 0.15),   # approaching full framerate
+        (64, 256, 0.25),   # full framerate refinement
     ]
 
-    def _make_init_spectrum(res, run_seed):
-        """Random spectrum at a given spatial resolution."""
+    def _make_init_spectrum(res, n_frames, run_seed):
+        """Random spectrum at a given spatial resolution and frame count."""
         torch.manual_seed(run_seed)
         w_rfft = res // 2 + 1
-        init = torch.rand(1, n_opt_frames, 3, res, res, device=device)
+        init = torch.rand(1, n_frames, 3, res, res, device=device)
         logits = torch.logit(init.clamp(1e-4, 1 - 1e-4))
         return torch.view_as_real(
             torch.fft.rfft2(logits, norm="ortho")
-        ).detach().clone()   # (1, n_opt_frames, 3, res, w_rfft, 2)
+        ).detach().clone()   # (1, n_frames, 3, res, w_rfft, 2)
 
-    def _upsample_spectrum(spectrum_params, new_h):
+    def _upsample_spectrum_spatial(spectrum_params, new_h):
         """Embed existing low-res spectrum into a larger tensor.
 
         New high-frequency coefficients are initialized to zero so the
         image stays smooth right after upsampling.
         """
         old = torch.view_as_complex(spectrum_params.detach().clone())
+        n_frm = old.shape[1]
         old_h, old_w = old.shape[-2], old.shape[-1]
         new_w = new_h // 2 + 1
         full = torch.zeros(
-            1, n_opt_frames, 3, new_h, new_w,
+            1, n_frm, 3, new_h, new_w,
             dtype=old.dtype, device=old.device,
         )
         pos_h = (old_h + 1) // 2
@@ -533,11 +544,34 @@ def feature_viz(
             full[:, :, :, -neg_h:, :w_copy] = old[:, :, :, -neg_h:, :w_copy]
         return torch.view_as_real(full).requires_grad_(True)
 
+    def _upsample_spectrum_temporal(spectrum_params, new_n_frames):
+        """Interpolate spectrum along temporal dimension to add more frames.
+
+        Uses linear interpolation on the real-valued view so intermediate
+        frames start as smooth blends of their neighbours.
+        """
+        # spectrum_params shape: (1, old_n_frames, 3, H, W_rfft, 2)
+        old = spectrum_params.detach().clone()
+        old_n = old.shape[1]
+        if old_n == new_n_frames:
+            return old.requires_grad_(True)
+        # Reshape to (1, old_n, 3*H*W_rfft*2) for F.interpolate
+        rest = old.shape[2:]           # (3, H, W_rfft, 2)
+        flat = old.reshape(1, old_n, -1)  # (1, old_n, D)
+        flat = flat.permute(0, 2, 1)      # (1, D, old_n) — interpolate last dim
+        up = F.interpolate(flat, size=new_n_frames, mode="linear",
+                           align_corners=True)
+        up = up.permute(0, 2, 1)          # (1, new_n_frames, D)
+        up = up.reshape(1, new_n_frames, *rest)
+        return up.requires_grad_(True)
+
     def run_optim(n_steps, lam_fft, run_seed, run_dir):
         """Progressive multi-scale optimization run.
 
-        Optimizes Fourier coefficients at 64 → 128 → 256, spending more
-        steps at higher resolutions.  Returns (final_frames, loss_list).
+        Optimizes Fourier coefficients with progressive spatial resolution
+        (64 → 128 → 256) and progressive temporal resolution (8 → 16 →
+        32 → 64 frames).  Spatial ramps first, then temporal.
+        Returns (final_frames, loss_list).
         """
         run_dir.mkdir(parents=True, exist_ok=True)
         random.seed(run_seed)
@@ -545,22 +579,40 @@ def feature_viz(
         # Temporal smoothness weight — gentle, 10× less than spectral penalty.
         lam_temporal = lam_fft * 0.1
 
+        # In single_frame mode, collapse all stages to 1 frame and
+        # merge duplicate (1, res) entries by summing their fractions.
+        if single_frame:
+            seen = {}
+            for n_frm, res, frac in STAGES:
+                key = (1, res)
+                seen[key] = seen.get(key, 0.0) + frac
+            active_stages = [(n_f, r, f) for (n_f, r), f in seen.items()]
+        else:
+            active_stages = list(STAGES)
+
         losses = []
         global_step = 0
         spectrum_params = None
+        cur_res = 0
+        cur_n_frames = 0
 
-        for stage_idx, (res, frac) in enumerate(STAGES):
+        for stage_idx, (n_frm, res, frac) in enumerate(active_stages):
             stage_steps = max(1, int(n_steps * frac))
             w_rfft = res // 2 + 1
-            print(f"      stage {stage_idx}: {res}×{res}  "
-                  f"({stage_steps} steps, spectrum {res}×{w_rfft})")
+            print(f"      stage {stage_idx}: {n_frm}f @ {res}×{res}  "
+                  f"({stage_steps} steps, spectrum {n_frm}×{res}×{w_rfft})")
 
             # Initialize or upsample from previous stage
             if spectrum_params is None:
-                spectrum_params = _make_init_spectrum(res, run_seed)
+                spectrum_params = _make_init_spectrum(res, n_frm, run_seed)
                 spectrum_params.requires_grad_(True)
             else:
-                spectrum_params = _upsample_spectrum(spectrum_params, res)
+                if res != cur_res:
+                    spectrum_params = _upsample_spectrum_spatial(spectrum_params, res)
+                if n_frm != cur_n_frames:
+                    spectrum_params = _upsample_spectrum_temporal(spectrum_params, n_frm)
+            cur_res = res
+            cur_n_frames = n_frm
 
             # Fresh optimizer + cosine schedule per stage
             lr_max = 0.03 if stage_idx == 0 else 0.01
