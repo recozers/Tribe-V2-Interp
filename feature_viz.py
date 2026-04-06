@@ -105,7 +105,7 @@ FSAVERAGE5_VERTS = 10242  # vertices per hemisphere
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu="A100-40GB",
     volumes={CACHE: weights_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=18000,
@@ -367,18 +367,23 @@ def feature_viz(
     color_corr = color_corr / color_corr.norm(dim=0, keepdim=True).max()
 
     # How many temporal frames to optimize (1 if single_frame, 64 otherwise).
+    # Current color blend factor — updated per stage in run_optim.
+    # 0.0 = grayscale (all channels identical), 1.0 = full color.
+    _color_blend = 1.0
+
     # In single_frame mode we optimize one frame and tile it to 64 before
     # feeding V-JEPA 2, so all optimization budget goes into spatial structure.
     def frames_from_spectrum(spectrum_params):
-        """Inverse FFT → color decorrelation → sigmoid → frames in [0, 1].
+        """Inverse FFT → grayscale/color blend → color decorrelation → sigmoid.
 
         spectrum_params may be smaller than full resolution (progressive
         multi-scale).  We zero-pad to 256×256 before IRFFT so V-JEPA 2
         always gets the resolution it expects.
 
-        In single_frame mode, spectrum_params has temporal dim 1 and the
-        result is tiled to 64 frames.  In progressive temporal mode,
-        fewer-than-64 frames are linearly interpolated to 64.
+        Color blending: at _color_blend=0 the 3 decorrelated channels
+        are averaged to grayscale before applying the color correlation
+        matrix, forcing the optimizer to work with luminance only.
+        At _color_blend=1 all 3 channels are independent (full color).
         """
         spectrum = torch.view_as_complex(spectrum_params)
         # spectrum shape: (1, cur_n_frames, 3, cur_h, cur_w_rfft)
@@ -402,7 +407,15 @@ def feature_viz(
         logits = torch.fft.irfft2(
             spectrum, s=(FRAME_SIZE, FRAME_SIZE), norm="ortho",
         )
-        # Apply color correlation: einsum over channel dim
+        # logits: (1, n_frames, 3, 256, 256) — decorrelated channels
+
+        # Grayscale → color blend.  At blend=0, collapse all 3 channels
+        # to their mean (pure luminance).  At blend=1, pass through.
+        if _color_blend < 1.0:
+            gray = logits.mean(dim=2, keepdim=True)  # (1, n, 1, H, W)
+            logits = gray + _color_blend * (logits - gray)
+
+        # Apply color correlation: decorrelated → natural RGB
         logits = torch.einsum("btchw, cd -> btdhw", logits, color_corr)
         frames = torch.sigmoid(logits)
 
@@ -498,18 +511,19 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    # Progressive resolution stages: spatial first, then temporal ramp-up.
-    # Early stages use few frames at low spatial res to cheaply establish
-    # structure; later stages add temporal detail at full spatial resolution.
+    # Progressive resolution stages: spatial → temporal → color.
+    # Early stages use few frames at low spatial res in grayscale to
+    # find luminance structure (edges, orientation).  Color is introduced
+    # gradually via color_blend: 0.0 = fully grayscale, 1.0 = full color.
     STAGES = [
-        # (n_frames, spatial_res, fraction_of_total_steps)
-        (1,  64,  0.08),   # single frame, coarse spatial blobs
-        (1,  128, 0.10),   # single frame, mid-frequency spatial
-        (1,  256, 0.12),   # single frame, full spatial detail
-        (8,  256, 0.15),   # first temporal expansion
-        (16, 256, 0.15),   # more temporal detail
-        (32, 256, 0.15),   # approaching full framerate
-        (64, 256, 0.25),   # full framerate refinement
+        # (n_frames, spatial_res, fraction_of_total_steps, color_blend)
+        (1,  64,  0.08, 0.0),   # grayscale, coarse spatial blobs
+        (1,  128, 0.10, 0.0),   # grayscale, mid-frequency spatial
+        (1,  256, 0.12, 0.3),   # introduce some color at full spatial res
+        (8,  256, 0.15, 0.6),   # temporal expansion + more color
+        (16, 256, 0.15, 0.8),   # more temporal detail
+        (32, 256, 0.15, 1.0),   # full color, approaching full framerate
+        (64, 256, 0.25, 1.0),   # full color, full framerate refinement
     ]
 
     def _make_init_spectrum(res, n_frames, run_seed):
@@ -581,12 +595,16 @@ def feature_viz(
 
         # In single_frame mode, collapse all stages to 1 frame and
         # merge duplicate (1, res) entries by summing their fractions.
+        # Use the max color_blend from merged stages.
         if single_frame:
             seen = {}
-            for n_frm, res, frac in STAGES:
+            max_cb = {}
+            for n_frm, res, frac, cb in STAGES:
                 key = (1, res)
                 seen[key] = seen.get(key, 0.0) + frac
-            active_stages = [(n_f, r, f) for (n_f, r), f in seen.items()]
+                max_cb[key] = max(max_cb.get(key, 0.0), cb)
+            active_stages = [(n_f, r, f, max_cb[(n_f, r)])
+                             for (n_f, r), f in seen.items()]
         else:
             active_stages = list(STAGES)
 
@@ -596,11 +614,14 @@ def feature_viz(
         cur_res = 0
         cur_n_frames = 0
 
-        for stage_idx, (n_frm, res, frac) in enumerate(active_stages):
+        for stage_idx, (n_frm, res, frac, cb) in enumerate(active_stages):
+            nonlocal _color_blend
+            _color_blend = cb
             stage_steps = max(1, int(n_steps * frac))
             w_rfft = res // 2 + 1
+            color_str = "gray" if cb == 0.0 else f"color={cb:.0%}"
             print(f"      stage {stage_idx}: {n_frm}f @ {res}×{res}  "
-                  f"({stage_steps} steps, spectrum {n_frm}×{res}×{w_rfft})")
+                  f"{color_str}  ({stage_steps} steps)")
 
             # Initialize or upsample from previous stage
             if spectrum_params is None:
