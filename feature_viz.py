@@ -517,11 +517,11 @@ def feature_viz(
     # gradually via color_blend: 0.0 = fully grayscale, 1.0 = full color.
     STAGES = [
         # (n_frames, spatial_res, fraction_of_total_steps, color_blend)
-        (1,  64,  0.08, 0.0),   # grayscale, coarse spatial blobs
-        (1,  128, 0.10, 0.0),   # grayscale, mid-frequency spatial
-        (1,  256, 0.12, 0.3),   # introduce some color at full spatial res
-        (8,  256, 0.15, 0.6),   # temporal expansion + more color
-        (16, 256, 0.15, 0.8),   # more temporal detail
+        (1,  64,  0.10, 0.0),   # grayscale, coarse spatial blobs
+        (1,  128, 0.15, 0.0),   # grayscale, mid-frequency spatial
+        (1,  256, 0.15, 0.0),   # grayscale, full spatial detail
+        (8,  256, 0.10, 0.3),   # temporal expansion + introduce color
+        (16, 256, 0.10, 0.6),   # more temporal detail + more color
         (32, 256, 0.15, 1.0),   # full color, approaching full framerate
         (64, 256, 0.25, 1.0),   # full color, full framerate refinement
     ]
@@ -745,7 +745,7 @@ def feature_viz(
     # 4. Lambda_fft sweep
     # ==================================================================
 
-    best_lambda = 1e-4   # fallback if sweep is skipped
+    best_lambda = 1e-3   # fallback if sweep is skipped
 
     if not skip_sweep:
         print("\n>>> [4a] Lambda_fft sweep <<<")
