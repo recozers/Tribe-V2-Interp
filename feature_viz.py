@@ -593,18 +593,11 @@ def feature_viz(
         # Temporal smoothness weight — gentle, 10× less than spectral penalty.
         lam_temporal = lam_fft * 0.1
 
-        # In single_frame mode, collapse all stages to 1 frame and
-        # merge duplicate (1, res) entries by summing their fractions.
-        # Use the max color_blend from merged stages.
+        # In single_frame mode, override frame count to 1 but preserve
+        # the spatial resolution and color progression from each stage.
         if single_frame:
-            seen = {}
-            max_cb = {}
-            for n_frm, res, frac, cb in STAGES:
-                key = (1, res)
-                seen[key] = seen.get(key, 0.0) + frac
-                max_cb[key] = max(max_cb.get(key, 0.0), cb)
-            active_stages = [(n_f, r, f, max_cb[(n_f, r)])
-                             for (n_f, r), f in seen.items()]
+            active_stages = [(1, res, frac, cb)
+                             for (_, res, frac, cb) in STAGES]
         else:
             active_stages = list(STAGES)
 
