@@ -104,6 +104,10 @@ A gentle L2 penalty on frame-to-frame pixel differences (`λ_temporal = 0.1 × �
 
 TRIBE v2 was trained with modality dropout (p=0.3), randomly zeroing out entire modalities during training. We exploit this by providing only video features — the model's `aggregate_features` auto-fills zeros for missing text and audio modalities. This is equivalent to a training condition the model has seen, so predictions remain meaningful.
 
+### Lambda sweep selects by activation, not loss
+
+The sweep evaluates multiple λ_fft values and picks the one that produces the highest raw ROI activation — not the lowest total loss. This is important because the total loss includes the spectral penalty term, which scales with λ. Selecting by loss would be biased toward low λ (less penalty = lower loss, regardless of activation quality).
+
 ### Validation: selectivity check
 
 After optimization, we measure predicted activation across all ROIs in the Glasser parcellation (V1, V2, V3, V4, MT, FFA, PPA) for both the optimized stimulus and random noise baselines (5 seeds). Key metrics:
@@ -134,3 +138,5 @@ Any raw HCP label can also be passed directly (e.g., `--target-roi MST`).
 - **Token ordering:** V-JEPA 2's Conv3d patch embedding flattens tokens in (T, H, W) order. We reshape `(B, 8192, D)` → `(B, 32, 256, D)` and spatial-average-pool to `(B, 32, D)`.
 
 - **Hidden states indexing:** V-JEPA 2 uses HuggingFace's `OutputRecorder` — `hidden_states` is 0-indexed with length `num_hidden_layers` (no embedding entry). `hidden_states[39]` is the last layer output.
+
+- **Gradient checkpointing + hidden states:** We use `output_hidden_states=True` rather than forward hooks for extracting layer features. Forward hooks interact unreliably with gradient checkpointing (hooks fire during both the original forward and the recompute-during-backward, potentially capturing detached tensors). `output_hidden_states` is explicitly supported by HuggingFace's checkpointing implementation. The extra ~1.6 GB for storing 40 vs 3 hidden states is acceptable given our 18 GB peak on A100-40GB.

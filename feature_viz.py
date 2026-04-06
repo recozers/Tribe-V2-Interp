@@ -185,29 +185,8 @@ def feature_viz(
         n_enc_layers - 1,                                    # 39
     ]
 
-    # ── Selective layer hooks ──
-    # Instead of output_hidden_states=True (which stores all 40 layers,
-    # ~1.8 GB), we register forward hooks on only the 3 layers we need.
-    # This avoids holding the other 37 in memory.
-    _captured_hiddens = {}
-
-    def _make_hook(layer_idx):
-        def hook(module, input, output):
-            # VJEPA2Layer returns (hidden_states, attn_weights)
-            h = output[0] if isinstance(output, tuple) else output
-            _captured_hiddens[layer_idx] = h
-        return hook
-
-    # Resolve layer modules and attach hooks.
-    # V-JEPA 2 encoder layers live at vjepa.encoder.layer[i]
-    encoder_layers = vjepa.encoder.layer
-    hook_handles = []
-    for li in layer_indices:
-        handle = encoder_layers[li].register_forward_hook(_make_hook(li))
-        hook_handles.append(handle)
-
     print(f"    {n_enc_layers} layers, dim={enc_dim}, "
-          f"hooks on layers {layer_indices}")
+          f"extracting layers {layer_indices} via output_hidden_states")
     weights_vol.commit()
 
     # ==================================================================
@@ -439,9 +418,12 @@ def feature_viz(
         """
         spectrum = torch.view_as_complex(spectrum_params)
         cur_h, cur_w_rfft = spectrum.shape[-2], spectrum.shape[-1]
+        # Spatial width = (cur_w_rfft - 1) * 2, since rfft2 output has
+        # width n//2 + 1 for input width n.  For square images cur_w == cur_h,
+        # but we derive it correctly from cur_w_rfft to be safe.
+        cur_w = (cur_w_rfft - 1) * 2
         fy = torch.fft.fftfreq(cur_h, device=device, dtype=torch.float32)
-        fx = torch.fft.rfftfreq(cur_h * 2 - 1 if cur_w_rfft > 1 else 1,
-                                device=device, dtype=torch.float32)[:cur_w_rfft]
+        fx = torch.fft.rfftfreq(cur_w, device=device, dtype=torch.float32)
         freq_r = torch.sqrt(fy[:, None].pow(2) + fx[None, :].pow(2))
         # Quadratic penalty: higher frequencies penalized more
         fw = (freq_r / (freq_r.max() + 1e-8)).pow(2)
@@ -465,33 +447,33 @@ def feature_viz(
 
         Pipeline:
           1. ImageNet-normalize
-          2. V-JEPA 2 forward (hooks capture 3 target layers only)
-          3. Reshape (B, 8192, D) → (B, 32, 256, D) → spatial mean → (B, 32, D)
+          2. V-JEPA 2 forward with output_hidden_states=True
+          3. Index target layers, reshape (B, 8192, D) → (B, 32, 256, D)
+             → spatial mean → (B, 32, D)
           4. Stack layers → (B, n_layers, D, 32)  (TRIBE v2 format)
           5. TRIBE v2 forward with only video features (text/audio = zeros)
           6. Returns (1, n_vertices, n_output_timesteps)
 
-        Memory: gradient checkpointing recomputes layer activations during
-        backward.  Forward hooks on 3 target layers capture only what we
-        need (~135 MB) instead of all 40 layers (~1.8 GB).
+        Uses output_hidden_states=True rather than forward hooks for
+        correctness with gradient checkpointing.  Costs ~1.6 GB extra
+        (40 hidden states vs 3) but guarantees gradients flow correctly.
         """
         normed = (frames - mean_t) / std_t
 
-        # Clear captured states from previous call
-        _captured_hiddens.clear()
-
-        # V-JEPA 2 forward — hooks fire on layers 20, 30, 39 and
-        # populate _captured_hiddens.  No output_hidden_states needed.
+        # V-JEPA 2 forward — returns all layer hidden states.
+        # HuggingFace's checkpointing implementation explicitly supports
+        # output_hidden_states; the returned tensors are proper autograd
+        # graph nodes at checkpoint segment boundaries.
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            vjepa(pixel_values_videos=normed)
+            out = vjepa(pixel_values_videos=normed, output_hidden_states=True)
 
-        # Extract hooked hidden states, pool over spatial tokens.
+        # Extract target-layer hidden states, pool over spatial tokens.
         # V-JEPA 2 Conv3d patch embedding flattens in (T, H, W) order,
         # so the first S_TOKENS=256 entries at each temporal position are
         # the spatial patches for that frame-pair.
         feats = []
         for li in layer_indices:
-            h = _captured_hiddens[li]                   # (1, T_tok*S_tok, D)
+            h = out.hidden_states[li]                   # (1, T_tok*S_tok, D)
             h = h.reshape(1, T_TOKENS, S_TOKENS, -1)   # (1, 32, 256, D)
             h = h.mean(dim=2)                           # (1, 32, D)  — spatial pool
             feats.append(h)
@@ -511,10 +493,11 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    # Progressive resolution stages: spatial → temporal → color.
-    # Early stages use few frames at low spatial res in grayscale to
-    # find luminance structure (edges, orientation).  Color is introduced
-    # gradually via color_blend: 0.0 = fully grayscale, 1.0 = full color.
+    # Progressive resolution stages.  Spatial resolution ramps up
+    # (64 → 128 → 256) then temporal frames ramp up (1 → 8 → ... → 64).
+    # Color blend: 0.0 = grayscale, 1.0 = full color.
+    # Step fractions determine when each transition happens within a
+    # single global cosine LR schedule.
     STAGES = [
         # (n_frames, spatial_res, fraction_of_total_steps, color_blend)
         (1,  64,  0.10, 0.0),   # grayscale, coarse spatial blobs
@@ -580,61 +563,83 @@ def feature_viz(
         return up.requires_grad_(True)
 
     def run_optim(n_steps, lam_fft, run_seed, run_dir):
-        """Progressive multi-scale optimization run.
+        """Progressive multi-scale optimization with one global LR schedule.
 
-        Optimizes Fourier coefficients with progressive spatial resolution
-        (64 → 128 → 256) and progressive temporal resolution (8 → 16 →
-        32 → 64 frames).  Spatial ramps first, then temporal.
-        Returns (final_frames, loss_list).
+        Resolution/temporal/color stages control the spectrum size and
+        color blend, but the cosine LR schedule spans all n_steps
+        continuously.  A new Adam optimizer is created only when the
+        spectrum tensor changes shape (upsampling); the LR schedule
+        does not reset.
         """
         run_dir.mkdir(parents=True, exist_ok=True)
         random.seed(run_seed)
 
-        # Temporal smoothness weight — gentle, 10× less than spectral penalty.
         lam_temporal = lam_fft * 0.1
 
-        # In single_frame mode, override frame count to 1 but preserve
-        # the spatial resolution and color progression from each stage.
         if single_frame:
             active_stages = [(1, res, frac, cb)
                              for (_, res, frac, cb) in STAGES]
         else:
             active_stages = list(STAGES)
 
+        # One cosine schedule across all steps: 0.03 → 0.001
+        lr_max, lr_min = 0.03, 0.001
+
+        # Pre-compute which global step each stage starts at
+        stage_boundaries = []
+        s = 0
+        for _, _, frac, _ in active_stages:
+            stage_steps = max(1, int(n_steps * frac))
+            stage_boundaries.append((s, s + stage_steps))
+            s += stage_steps
+
         losses = []
         global_step = 0
         spectrum_params = None
+        opt = None
         cur_res = 0
         cur_n_frames = 0
+
+        # Cosine LR lambda — maps global_step to LR multiplier
+        def lr_lambda(step):
+            # step arg is optimizer-internal step counter, but we override
+            # with global_step via scheduler.step() each iteration
+            progress = global_step / max(n_steps - 1, 1)
+            import math
+            return lr_min / lr_max + (1 - lr_min / lr_max) * (
+                0.5 * (1 + math.cos(math.pi * progress))
+            )
 
         for stage_idx, (n_frm, res, frac, cb) in enumerate(active_stages):
             nonlocal _color_blend
             _color_blend = cb
-            stage_steps = max(1, int(n_steps * frac))
-            w_rfft = res // 2 + 1
+            start, end = stage_boundaries[stage_idx]
+            stage_steps = end - start
             color_str = "gray" if cb == 0.0 else f"color={cb:.0%}"
             print(f"      stage {stage_idx}: {n_frm}f @ {res}×{res}  "
                   f"{color_str}  ({stage_steps} steps)")
 
             # Initialize or upsample from previous stage
+            need_new_opt = False
             if spectrum_params is None:
                 spectrum_params = _make_init_spectrum(res, n_frm, run_seed)
                 spectrum_params.requires_grad_(True)
+                need_new_opt = True
             else:
                 if res != cur_res:
                     spectrum_params = _upsample_spectrum_spatial(spectrum_params, res)
+                    need_new_opt = True
                 if n_frm != cur_n_frames:
                     spectrum_params = _upsample_spectrum_temporal(spectrum_params, n_frm)
+                    need_new_opt = True
             cur_res = res
             cur_n_frames = n_frm
 
-            # Fresh optimizer + cosine schedule per stage
-            lr_max = 0.03 if stage_idx == 0 else 0.01
-            lr_min = 0.003 if stage_idx == 0 else 0.001
-            opt = torch.optim.Adam([spectrum_params], lr=lr_max)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=stage_steps, eta_min=lr_min,
-            )
+            # New Adam only when the tensor changed shape (momentum doesn't
+            # transfer across shapes).  LR schedule is global and continuous.
+            if need_new_opt:
+                opt = torch.optim.Adam([spectrum_params], lr=lr_max)
+                scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
             for step in range(stage_steps):
                 opt.zero_grad()
@@ -658,7 +663,6 @@ def feature_viz(
                 roi_act = preds[:, roi_verts, :].float().mean()
                 freq_reg = spectral_penalty(spectrum_params)
                 loss = -roi_act + lam_fft * freq_reg
-                # Temporal smoothness only when optimizing multiple frames
                 if not single_frame:
                     temporal_reg = (frames[:, 1:] - frames[:, :-1]).pow(2).mean()
                     loss = loss + lam_temporal * temporal_reg
@@ -669,7 +673,6 @@ def feature_viz(
                 opt.step()
                 scheduler.step()
 
-                # Log peak VRAM on first step
                 if global_step == 0:
                     peak = torch.cuda.max_memory_allocated() / 1e9
                     cur = torch.cuda.memory_allocated() / 1e9
@@ -679,9 +682,9 @@ def feature_viz(
                 lv = loss.item()
                 losses.append(lv)
 
-                if global_step % 50 == 0 or (stage_idx == len(STAGES) - 1
+                if global_step % 50 == 0 or (stage_idx == len(active_stages) - 1
                                               and step == stage_steps - 1):
-                    cur_lr = scheduler.get_last_lr()[0]
+                    cur_lr = opt.param_groups[0]["lr"]
                     print(f"    step {global_step:4d}  loss={lv:+.4f}  "
                           f"act={roi_act.item():.4f}  fft={freq_reg.item():.4f}  "
                           f"temp={temporal_reg.item():.4f}  lr={cur_lr:.4f}")
@@ -695,14 +698,16 @@ def feature_viz(
 
                 global_step += 1
 
-        # Save final state
+        # Save final state and measure raw activation (without penalty)
         with torch.no_grad():
             final_frames = frames_from_spectrum(spectrum_params)
+            final_preds = forward_pass(final_frames)
+            final_act = final_preds[:, roi_verts, :].float().mean().item()
         _save_grid(final_frames, run_dir / "frames_final.png", "final")
         _save_losses(losses, run_dir / "loss_curve.png", f"λ_fft = {lam_fft}")
         weights_vol.commit()
 
-        return final_frames.detach().clone(), losses
+        return final_frames.detach().clone(), losses, final_act
 
     # ==================================================================
     # Helper: visualization
@@ -750,28 +755,28 @@ def feature_viz(
     if not skip_sweep:
         print("\n>>> [4a] Lambda_fft sweep <<<")
         lambdas = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
-        final_losses = {}
+        final_acts = {}
 
         for lam in lambdas:
             print(f"\n  ── λ_fft = {lam} ──")
             sweep_dir = out_root / "sweep" / f"lambda_{lam:.0e}"
-            _, losses = run_optim(sweep_steps, lam, seed, sweep_dir)
-            final_losses[lam] = losses[-1]
+            _, _, act = run_optim(sweep_steps, lam, seed, sweep_dir)
+            final_acts[lam] = act
 
-        # Comparison bar chart
+        # Comparison bar chart — plot raw activation (what we actually care about)
         fig, ax = plt.subplots(figsize=(8, 4))
         labels_str = [f"{l:.0e}" for l in lambdas]
-        objectives = [-final_losses[l] for l in lambdas]
-        ax.bar(labels_str, objectives)
-        ax.set(xlabel="λ_fft", ylabel="Final objective (higher = better)",
+        act_vals = [final_acts[l] for l in lambdas]
+        ax.bar(labels_str, act_vals)
+        ax.set(xlabel="λ_fft", ylabel="Final mean ROI activation (higher = better)",
                title="Lambda sweep")
         fig.tight_layout()
         fig.savefig(str(out_root / "sweep" / "comparison.png"), dpi=150)
         plt.close(fig)
 
-        best_lambda = min(final_losses, key=final_losses.get)
+        best_lambda = max(final_acts, key=final_acts.get)
         print(f"\n    Best λ_fft = {best_lambda} "
-              f"(final loss = {final_losses[best_lambda]:.4f})")
+              f"(activation = {final_acts[best_lambda]:.4f})")
         weights_vol.commit()
 
     # ==================================================================
@@ -781,18 +786,18 @@ def feature_viz(
     print(f"\n>>> [4b] Full optimization ──  λ_fft={best_lambda}  "
           f"{full_steps} steps × {n_restarts} restarts <<<")
 
-    best_loss = float("inf")
+    best_act = float("-inf")
     best_frames = None
 
     for r in range(n_restarts):
         print(f"\n  ── Restart {r + 1}/{n_restarts} ──")
         run_dir = out_root / "full" / f"restart_{r}"
-        frames, losses = run_optim(full_steps, best_lambda, seed + r * 1000, run_dir)
+        frames, losses, act = run_optim(full_steps, best_lambda, seed + r * 1000, run_dir)
 
-        if losses[-1] < best_loss:
-            best_loss = losses[-1]
+        if act > best_act:
+            best_act = act
             best_frames = frames
-            print(f"    *** new best  (loss = {best_loss:.4f})")
+            print(f"    *** new best  (act = {best_act:.4f})")
 
     # Save overall best result
     _save_grid(best_frames, out_root / "best_frames.png",
@@ -944,7 +949,7 @@ def feature_viz(
     weights_vol.commit()
 
     print(f"\n{'='*60}")
-    print(f"  Done!  target={target_roi}  best_loss={best_loss:.4f}")
+    print(f"  Done!  target={target_roi}  best_act={best_act:.4f}")
     print(f"  Results in Modal volume 'tribe-v2-weights'")
     print(f"    → outputs/{target_roi}/sweep/        (lambda sweep)")
     print(f"    → outputs/{target_roi}/full/          (5 restarts)")
