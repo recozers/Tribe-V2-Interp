@@ -448,34 +448,36 @@ def feature_viz(
         Pipeline:
           1. ImageNet-normalize
           2. V-JEPA 2 forward with output_hidden_states=True
-          3. Index target layers, reshape (B, 8192, D) → (B, 32, 256, D)
-             → spatial mean → (B, 32, D)
-          4. Stack layers → (B, n_layers, D, 32)  (TRIBE v2 format)
+          3. Index target layers, reshape → spatial mean
+          4. Stack layers → TRIBE v2 format (B, n_layers, D, T)
           5. TRIBE v2 forward with only video features (text/audio = zeros)
           6. Returns (1, n_vertices, n_output_timesteps)
 
-        Uses output_hidden_states=True rather than forward hooks for
-        correctness with gradient checkpointing.  Costs ~1.6 GB extra
-        (40 hidden states vs 3) but guarantees gradients flow correctly.
+        In single_frame mode, we only pass 2 identical frames (one
+        tubelet) through V-JEPA 2 instead of 64, giving 256 tokens
+        instead of 8192 — a 32× speedup.  The spatial features are
+        identical since every frame is the same.
         """
         normed = (frames - mean_t) / std_t
 
-        # V-JEPA 2 forward — returns all layer hidden states.
-        # HuggingFace's checkpointing implementation explicitly supports
-        # output_hidden_states; the returned tensors are proper autograd
-        # graph nodes at checkpoint segment boundaries.
+        # In single_frame mode, all 64 frames are identical.  V-JEPA 2's
+        # tubelet_size=2 groups frame pairs, so we only need 2 frames
+        # (one tubelet) to get the same spatial features.  This gives
+        # 1 temporal × 256 spatial = 256 tokens vs 32 × 256 = 8192.
+        if single_frame:
+            normed = normed[:, :2, :, :, :]  # just one tubelet pair
+            t_tokens = 1
+        else:
+            t_tokens = T_TOKENS  # 32
+
         with torch.amp.autocast("cuda", dtype=torch.float16):
             out = vjepa(pixel_values_videos=normed, output_hidden_states=True)
 
-        # Extract target-layer hidden states, pool over spatial tokens.
-        # V-JEPA 2 Conv3d patch embedding flattens in (T, H, W) order,
-        # so the first S_TOKENS=256 entries at each temporal position are
-        # the spatial patches for that frame-pair.
         feats = []
         for li in layer_indices:
-            h = out.hidden_states[li]                   # (1, T_tok*S_tok, D)
-            h = h.reshape(1, T_TOKENS, S_TOKENS, -1)   # (1, 32, 256, D)
-            h = h.mean(dim=2)                           # (1, 32, D)  — spatial pool
+            h = out.hidden_states[li]                   # (1, t_tokens*S_tok, D)
+            h = h.reshape(1, t_tokens, S_TOKENS, -1)   # (1, t, 256, D)
+            h = h.mean(dim=2)                           # (1, t, D) — spatial pool
             feats.append(h)
 
         # Stack layers: (1, n_layers, 32, D) → permute to (1, n_layers, D, 32)
