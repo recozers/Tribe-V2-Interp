@@ -26,23 +26,29 @@ Fourier coefficients (optimized)
 ## Usage
 
 ```bash
+# One-time setup: HuggingFace token (needs access to vjepa2 and tribev2 repos)
+export HF_TOKEN=hf_...        # or: huggingface-cli login
+
 # Default: V1, with lambda sweep + 5 restarts
-modal run feature_viz.py
+python feature_viz.py
 
 # Target a different region
-modal run feature_viz.py --target-roi MT
-modal run feature_viz.py --target-roi FFA
+python feature_viz.py --target-roi MT
+python feature_viz.py --target-roi FFA
 
-# Skip the lambda sweep (use default λ_fft=1e-4)
-modal run feature_viz.py --skip-sweep
+# Skip the lambda sweep (use default λ_fft=1e-3)
+python feature_viz.py --skip-sweep
+
+# Single-frame mode (~32× faster, great for FFA/V1 static stimuli)
+python feature_viz.py --target-roi FFA --single-frame --skip-sweep --n-restarts 1
 
 # Custom steps/restarts
-modal run feature_viz.py --full-steps 3000 --n-restarts 3
+python feature_viz.py --full-steps 3000 --n-restarts 3
 ```
 
-**Requires:** A Modal account with an `HF_TOKEN` secret (named `huggingface-secret`) and access to the `facebook/vjepa2-vitg-fpc64-256` and `facebook/tribev2` HuggingFace repos.
+**Requires:** An `HF_TOKEN` environment variable (or `huggingface-cli login`) with access to `facebook/vjepa2-vitg-fpc64-256` and `facebook/tribev2` HuggingFace repos. Install dependencies per the docstring in `feature_viz.py`.
 
-**Hardware:** A100 80GB on Modal. Runs for ~2-4 hours depending on step count.
+**Hardware:** Local CUDA GPU with ≥24 GB VRAM (tested on RTX 3090; peak ~18.4 GB with gradient checkpointing). System RAM usage is modest (~6-8 GB peak during model load, ~3-4 GB steady state), so 16 GB is sufficient. Full 5-restart run takes ~3-6 hours on a 3090.
 
 ## Output
 

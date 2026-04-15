@@ -16,62 +16,30 @@ Algorithm (after Olah et al., "Feature Visualization", Distill 2017):
   3. Loss = −mean(target region activation) + λ_fft · spectral_penalty(coeffs)
   4. Backprop to Fourier coefficients, reconstruct frames with inverse FFT
 
-Usage:
-    modal run feature_viz.py                              # default V1
-    modal run feature_viz.py --target-roi MT              # target MT
-    modal run feature_viz.py --target-roi FFA --skip-sweep
+Local usage (3090, 24 GB VRAM):
+    export HF_TOKEN=hf_...        # or `huggingface-cli login`
+    python feature_viz.py                              # default V1
+    python feature_viz.py --target-roi FFA --single-frame
+    python feature_viz.py --target-roi V1 --skip-sweep --n-restarts 1
+
+Requirements (install once):
+    pip install torch>=2.5.1 torchvision numpy==2.2.6 einops pyyaml
+    pip install transformers>=4.50 huggingface_hub
+    pip install neuralset==0.0.2 neuraltrain==0.0.2 x_transformers==1.27.20 pydantic>=2 exca
+    pip install moviepy>=2.2.1 soundfile julius langdetect spacy Levenshtein gtts
+    pip install git+https://github.com/facebookresearch/tribev2.git
+    pip install matplotlib mne nibabel
 """
 
-import modal
+import argparse
 import os
+from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
-# Modal setup
+# Constants
 # ---------------------------------------------------------------------------
 
-app = modal.App("tribe-v2-feature-viz")
-weights_vol = modal.Volume.from_name("tribe-v2-weights", create_if_missing=True)
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "ffmpeg", "libsndfile1")
-    # Core ML stack
-    .pip_install(
-        "torch>=2.5.1,<2.7",
-        "torchvision>=0.20,<0.22",
-        "numpy==2.2.6",
-        "einops",
-        "pyyaml",
-    )
-    # HuggingFace
-    .pip_install("transformers>=4.50", "huggingface_hub")
-    # neuraltrain / neuralset (TRIBE v2 dependencies)
-    .pip_install(
-        "neuralset==0.0.2",
-        "neuraltrain==0.0.2",
-        "x_transformers==1.27.20",
-        "pydantic>=2",
-        "exca",
-    )
-    # Other tribev2 deps that must be importable
-    .pip_install(
-        "moviepy>=2.2.1",
-        "soundfile",
-        "julius",
-        "langdetect",
-        "spacy",
-        "Levenshtein",
-        "gtts",
-    )
-    # TRIBE v2 itself
-    .pip_install("tribev2 @ git+https://github.com/facebookresearch/tribev2.git")
-    # Visualization + parcellation
-    .pip_install("matplotlib", "mne", "nibabel")
-)
-
-# ── Constants ──────────────────────────────────────────────────────────────
-
-CACHE = "/cache"
 VJEPA2_REPO = "facebook/vjepa2-vitg-fpc64-256"
 TRIBE_REPO = "facebook/tribev2"
 
@@ -100,16 +68,9 @@ FSAVERAGE5_VERTS = 10242  # vertices per hemisphere
 
 
 # ---------------------------------------------------------------------------
-# Main function — runs on A100 80 GB
+# Main function — runs locally on CUDA GPU (3090 24 GB)
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=image,
-    gpu="A100-40GB",
-    volumes={CACHE: weights_vol},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=18000,
-)
 def feature_viz(
     target_roi: str = "V1",
     skip_sweep: bool = False,
@@ -118,9 +79,10 @@ def feature_viz(
     n_restarts: int = 5,
     seed: int = 42,
     single_frame: bool = False,
+    cache_dir: str = "./cache",
+    out_dir: str = "./outputs",
 ):
     import random
-    from pathlib import Path
 
     import matplotlib
     matplotlib.use("Agg")
@@ -129,18 +91,31 @@ def feature_viz(
     import numpy as np
     import torch
     import torch.nn.functional as F
-    from huggingface_hub import hf_hub_download
     from transformers import AutoModel
 
+    assert torch.cuda.is_available(), (
+        "CUDA is required — no GPU detected.  This script expects an RTX 3090 "
+        "(or any CUDA GPU with ≥24 GB VRAM)."
+    )
     device = torch.device("cuda")
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
     hf_token = os.environ.get("HF_TOKEN")
-    os.environ["HF_HOME"] = f"{CACHE}/hf"
+    if hf_token is None:
+        # Fall back to the huggingface-cli cached token if available
+        try:
+            from huggingface_hub import HfFolder
+            hf_token = HfFolder.get_token()
+        except Exception:
+            hf_token = None
 
-    out_root = Path(CACHE) / "outputs" / target_roi
+    cache_root = Path(cache_dir).expanduser().resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(cache_root / "hf"))
+
+    out_root = Path(out_dir).expanduser().resolve() / target_roi
     out_root.mkdir(parents=True, exist_ok=True)
 
     # ==================================================================
@@ -159,7 +134,7 @@ def feature_viz(
     print(">>> [1/4] Loading V-JEPA 2 (ViT-G)...")
     vjepa = AutoModel.from_pretrained(
         VJEPA2_REPO,
-        cache_dir=f"{CACHE}/vjepa2",
+        cache_dir=str(cache_root / "vjepa2"),
         torch_dtype=torch.float16,
         attn_implementation="sdpa",
         token=hf_token,
@@ -171,6 +146,7 @@ def feature_viz(
     # ── Gradient checkpointing ──
     # Recompute layer activations during backward instead of storing all
     # 40 layers.  Trades ~2× compute for ~60-70% activation memory savings.
+    # Essential for fitting on a 24 GB 3090 (peak ~18.4 GB with checkpointing).
     vjepa.gradient_checkpointing_enable()
 
     n_enc_layers = vjepa.config.num_hidden_layers  # 40
@@ -187,7 +163,6 @@ def feature_viz(
 
     print(f"    {n_enc_layers} layers, dim={enc_dim}, "
           f"extracting layers {layer_indices} via output_hidden_states")
-    weights_vol.commit()
 
     # ==================================================================
     # 2. Load TRIBE v2 — frozen brain encoder
@@ -208,7 +183,7 @@ def feature_viz(
 
     tribe_xp = TribeModel.from_pretrained(
         TRIBE_REPO,
-        cache_folder=f"{CACHE}/tribe_features",
+        cache_folder=str(cache_root / "tribe_features"),
         device="cuda",
     )
     tribe = tribe_xp._model   # the FmriEncoderModel
@@ -239,7 +214,6 @@ def feature_viz(
     reserved = torch.cuda.memory_reserved() / 1e9
     print(f"    VRAM after model load: {alloc:.1f} GB allocated, "
           f"{reserved:.1f} GB reserved")
-    weights_vol.commit()
 
     # ==================================================================
     # 3. Look up target ROI vertex indices
@@ -262,7 +236,7 @@ def feature_viz(
     # MNE's HCP parcellation reader expects fsaverage surfaces to exist.
     # Fetch fsaverage first, then add the HCP MMP1.0 annotation files.
     import mne
-    subjects_dir = Path(CACHE) / "freesurfer"
+    subjects_dir = cache_root / "freesurfer"
     subjects_dir.mkdir(parents=True, exist_ok=True)
     mne.datasets.fetch_fsaverage(
         subjects_dir=str(subjects_dir), verbose=False,
@@ -304,7 +278,6 @@ def feature_viz(
         f"No vertices found for '{target_roi}'.  "
         f"Valid names: V1 V2 V3 V4 MT FFA PPA (or raw HCP labels like FFC, MST, ...)"
     )
-    weights_vol.commit()
 
     # ==================================================================
     # Helper: ImageNet normalization tensors
@@ -707,7 +680,6 @@ def feature_viz(
             final_act = final_preds[:, roi_verts, :].float().mean().item()
         _save_grid(final_frames, run_dir / "frames_final.png", "final")
         _save_losses(losses, run_dir / "loss_curve.png", f"λ_fft = {lam_fft}")
-        weights_vol.commit()
 
         return final_frames.detach().clone(), losses, final_act
 
@@ -779,7 +751,6 @@ def feature_viz(
         best_lambda = max(final_acts, key=final_acts.get)
         print(f"\n    Best λ_fft = {best_lambda} "
               f"(activation = {final_acts[best_lambda]:.4f})")
-        weights_vol.commit()
 
     # ==================================================================
     # 5. Full runs with best lambda
@@ -948,17 +919,15 @@ def feature_viz(
     print(f"    Selectivity ratio:  {selectivity_ratio:.2f}× "
           f"(target / mean other ROIs)")
 
-    weights_vol.commit()
-
     print(f"\n{'='*60}")
     print(f"  Done!  target={target_roi}  best_act={best_act:.4f}")
-    print(f"  Results in Modal volume 'tribe-v2-weights'")
-    print(f"    → outputs/{target_roi}/sweep/        (lambda sweep)")
-    print(f"    → outputs/{target_roi}/full/          (5 restarts)")
-    print(f"    → outputs/{target_roi}/best_frames.png")
-    print(f"    → outputs/{target_roi}/best_individual/")
-    print(f"    → outputs/{target_roi}/selectivity.png")
-    print(f"    → outputs/{target_roi}/validation.json")
+    print(f"  Results in:  {out_root}")
+    print(f"    → {out_root}/sweep/        (lambda sweep)")
+    print(f"    → {out_root}/full/          ({n_restarts} restarts)")
+    print(f"    → {out_root}/best_frames.png")
+    print(f"    → {out_root}/best_individual/")
+    print(f"    → {out_root}/selectivity.png")
+    print(f"    → {out_root}/validation.json")
     print(f"{'='*60}")
 
 
@@ -966,22 +935,44 @@ def feature_viz(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-@app.local_entrypoint()
-def main(
-    target_roi: str = "V1",
-    skip_sweep: bool = False,
-    sweep_steps: int = 500,
-    full_steps: int = 3000,
-    n_restarts: int = 5,
-    seed: int = 42,
-    single_frame: bool = False,
-):
-    feature_viz.remote(
-        target_roi=target_roi,
-        skip_sweep=skip_sweep,
-        sweep_steps=sweep_steps,
-        full_steps=full_steps,
-        n_restarts=n_restarts,
-        seed=seed,
-        single_frame=single_frame,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Feature visualization for TRIBE v2 brain encoding model.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--target-roi", type=str, default="V1",
+                        help="ROI to optimize (V1/V2/V3/V4/MT/FFA/PPA or raw HCP label)")
+    parser.add_argument("--skip-sweep", action="store_true",
+                        help="Skip the λ_fft sweep (use default λ=1e-3)")
+    parser.add_argument("--sweep-steps", type=int, default=500,
+                        help="Steps per λ in the sweep")
+    parser.add_argument("--full-steps", type=int, default=3000,
+                        help="Steps per full restart")
+    parser.add_argument("--n-restarts", type=int, default=5,
+                        help="Number of full optimization restarts")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (restart r uses seed + r*1000)")
+    parser.add_argument("--single-frame", action="store_true",
+                        help="Optimize a single frame (tiled to 64); ~32× faster")
+    parser.add_argument("--cache-dir", type=str, default="./cache",
+                        help="Directory for model/dataset caches "
+                             "(HuggingFace, freesurfer, tribe features)")
+    parser.add_argument("--out-dir", type=str, default="./outputs",
+                        help="Directory for optimization outputs")
+    args = parser.parse_args()
+
+    feature_viz(
+        target_roi=args.target_roi,
+        skip_sweep=args.skip_sweep,
+        sweep_steps=args.sweep_steps,
+        full_steps=args.full_steps,
+        n_restarts=args.n_restarts,
+        seed=args.seed,
+        single_frame=args.single_frame,
+        cache_dir=args.cache_dir,
+        out_dir=args.out_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
