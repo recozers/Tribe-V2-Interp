@@ -526,16 +526,24 @@ def feature_viz(
         old = spectrum_params.detach().clone()
         old_n = old.shape[1]
         if old_n == new_n_frames:
-            return old.requires_grad_(True)
-        # Reshape to (1, old_n, 3*H*W_rfft*2) for F.interpolate
-        rest = old.shape[2:]           # (3, H, W_rfft, 2)
-        flat = old.reshape(1, old_n, -1)  # (1, old_n, D)
-        flat = flat.permute(0, 2, 1)      # (1, D, old_n) — interpolate last dim
-        up = F.interpolate(flat, size=new_n_frames, mode="linear",
-                           align_corners=True)
-        up = up.permute(0, 2, 1)          # (1, new_n_frames, D)
-        up = up.reshape(1, new_n_frames, *rest)
-        return up.requires_grad_(True)
+            return old.contiguous().requires_grad_(True)
+        # Reshape to (1, old_n, 3*H*W_rfft*2) for F.interpolate.
+        # Special-case old_n == 1 because F.interpolate with mode="linear"
+        # and align_corners=True is undefined for input size 1 — just tile.
+        rest = old.shape[2:]                # (3, H, W_rfft, 2)
+        if old_n == 1:
+            up = old.expand(1, new_n_frames, *rest)
+        else:
+            flat = old.reshape(1, old_n, -1)   # (1, old_n, D)
+            flat = flat.permute(0, 2, 1)       # (1, D, old_n) — interpolate last dim
+            up = F.interpolate(flat, size=new_n_frames, mode="linear",
+                               align_corners=True)
+            up = up.permute(0, 2, 1)           # (1, new_n_frames, D)
+            up = up.reshape(1, new_n_frames, *rest)
+        # view_as_complex (called downstream) requires last-dim stride 1;
+        # the permute/reshape/expand above do not guarantee that, so force
+        # a contiguous copy before handing the tensor back to the optimizer.
+        return up.contiguous().requires_grad_(True)
 
     def run_optim(n_steps, lam_fft, run_seed, run_dir):
         """Progressive multi-scale optimization with one global LR schedule.
