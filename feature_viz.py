@@ -126,6 +126,8 @@ def feature_viz(
     single_frame: bool = False,
     stages_preset: str = "progressive",
     lam_fft_override: float = None,
+    suppress_rois: list = None,
+    suppress_beta: float = 1.0,
     cache_dir: str = "./cache",
     out_dir: str = "./outputs",
 ):
@@ -325,6 +327,40 @@ def feature_viz(
         f"No vertices found for '{target_roi}'.  "
         f"Valid names: V1 V2 V3 V4 MT FFA PPA (or raw HCP labels like FFC, MST, ...)"
     )
+
+    # Suppression ROIs — their mean activation is subtracted from the loss
+    # so the optimizer is pushed to find stimuli that excite the target ROI
+    # but NOT these competitors.
+    def _lookup_roi_verts(roi_name):
+        wanted = ROI_MAP.get(roi_name, [roi_name])
+        verts = []
+        for hemi_prefix, offset in [("lh", 0), ("rh", FSAVERAGE5_VERTS)]:
+            annot_path = (subjects_dir / "fsaverage" / "label"
+                          / f"{hemi_prefix}.HCPMMP1.annot")
+            labels_arr, _, names = nbfs.read_annot(str(annot_path))
+            for i, name_bytes in enumerate(names):
+                nm = (name_bytes.decode("utf-8")
+                      if isinstance(name_bytes, bytes) else str(name_bytes))
+                clean = nm
+                if clean.startswith(("L_", "R_")):
+                    clean = clean[2:]
+                clean = clean.replace("_ROI", "")
+                if clean.endswith(("-lh", "-rh")):
+                    clean = clean[:-3]
+                if clean in wanted:
+                    v = np.where(labels_arr == i)[0]
+                    v = v[v < FSAVERAGE5_VERTS]
+                    verts.extend(v + offset)
+        return torch.tensor(sorted(set(verts)), dtype=torch.long, device=device)
+
+    suppress_rois = suppress_rois or []
+    suppress_verts_list = []
+    for sr in suppress_rois:
+        v = _lookup_roi_verts(sr)
+        assert len(v) > 0, f"No vertices found for suppression ROI '{sr}'"
+        suppress_verts_list.append(v)
+    if suppress_rois:
+        print(f"    suppressing: {', '.join(f'{r}({len(v)})' for r, v in zip(suppress_rois, suppress_verts_list))}  (β={suppress_beta})")
 
     # ==================================================================
     # Helper: ImageNet normalization tensors
@@ -680,6 +716,14 @@ def feature_viz(
                 roi_act = preds[:, roi_verts, :].float().mean()
                 freq_reg = spectral_penalty(spectrum_params)
                 loss = -roi_act + lam_fft * freq_reg
+                # Selective suppression: penalize activation in competitor ROIs
+                if suppress_verts_list:
+                    suppress_acts = [preds[:, sv, :].float().mean()
+                                     for sv in suppress_verts_list]
+                    suppress_act = torch.stack(suppress_acts).mean()
+                    loss = loss + suppress_beta * suppress_act
+                else:
+                    suppress_act = torch.tensor(0.0)
                 if not single_frame:
                     temporal_reg = (frames[:, 1:] - frames[:, :-1]).pow(2).mean()
                     loss = loss + lam_temporal * temporal_reg
@@ -702,8 +746,11 @@ def feature_viz(
                 if global_step % 50 == 0 or (stage_idx == len(active_stages) - 1
                                               and step == stage_steps - 1):
                     cur_lr = opt.param_groups[0]["lr"]
+                    supp_str = (f"  supp={suppress_act.item():.4f}"
+                                if suppress_verts_list else "")
                     print(f"    step {global_step:4d}  loss={lv:+.4f}  "
-                          f"act={roi_act.item():.4f}  fft={freq_reg.item():.4f}  "
+                          f"act={roi_act.item():.4f}{supp_str}  "
+                          f"fft={freq_reg.item():.4f}  "
                           f"temp={temporal_reg.item():.4f}  lr={cur_lr:.4f}")
 
                 if global_step % 200 == 0:
@@ -1005,6 +1052,11 @@ def main():
                         help="Stage progression preset")
     parser.add_argument("--lam-fft", type=float, default=None,
                         help="Override λ_fft (skips sweep; default 1e-3 if --skip-sweep)")
+    parser.add_argument("--suppress-rois", type=str, default="",
+                        help="Comma-separated ROIs to suppress during optimization "
+                             "(e.g. 'V4,MT'). Empty = no suppression.")
+    parser.add_argument("--suppress-beta", type=float, default=1.0,
+                        help="Weight on the suppression term (loss = -FFA + β·mean(suppress_ROIs))")
     parser.add_argument("--cache-dir", type=str, default="./cache",
                         help="Directory for model/dataset caches "
                              "(HuggingFace, freesurfer, tribe features)")
@@ -1022,6 +1074,8 @@ def main():
         single_frame=args.single_frame,
         stages_preset=args.stages_preset,
         lam_fft_override=args.lam_fft,
+        suppress_rois=[r.strip() for r in args.suppress_rois.split(",") if r.strip()],
+        suppress_beta=args.suppress_beta,
         cache_dir=args.cache_dir,
         out_dir=args.out_dir,
     )
