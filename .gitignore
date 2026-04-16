@@ -1,3 +1,53 @@
-/.video_deps
-/__pycache__
+## OS files
 .DS_Store
+
+## Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+## Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+## Notebook and local editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+## Local runtime files
+*.log
+*.tmp
+*.temp
+
+## Project-specific generated dependencies and outputs
+/.video_deps/
+/outputs/
+/downloaded_frames_latest/
+/downloaded_frames/
+
+## Generated media artifacts
+*.mp4
+*.mov
+*.avi
+*.gif
+overnight_experiments.sh
+.claude/scheduled_tasks.lock
+.claude/*

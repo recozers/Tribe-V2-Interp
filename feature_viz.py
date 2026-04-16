@@ -66,6 +66,51 @@ ROI_MAP = {
 
 FSAVERAGE5_VERTS = 10242  # vertices per hemisphere
 
+# Stage presets: each is a list of (n_frames, spatial_res, frac_steps, color_blend).
+# In single_frame mode, n_frames is overridden to 1 for all stages.
+STAGE_PRESETS = {
+    "progressive": [
+        # Original: gray coarse → gray fine → color + temporal ramp
+        (1,  64,  0.10, 0.0),
+        (1,  128, 0.15, 0.0),
+        (1,  256, 0.15, 0.0),
+        (8,  256, 0.10, 0.3),
+        (16, 256, 0.10, 0.6),
+        (32, 256, 0.15, 1.0),
+        (64, 256, 0.25, 1.0),
+    ],
+    "full": [
+        # No staging: full resolution + full color from the start
+        (64, 256, 1.0, 1.0),
+    ],
+    "res-only": [
+        # Resolution ramp but color from the start
+        (1,  64,  0.20, 1.0),
+        (1,  128, 0.30, 1.0),
+        (1,  256, 0.50, 1.0),
+    ],
+    "color-only": [
+        # Full resolution from start, grayscale → color progression
+        (1,  256, 0.30, 0.0),
+        (1,  256, 0.20, 0.3),
+        (1,  256, 0.20, 0.6),
+        (1,  256, 0.30, 1.0),
+    ],
+    "slow-coarse": [
+        # Spend much more time at low resolution (coarse structure first)
+        (1,  64,  0.40, 0.0),
+        (1,  128, 0.25, 0.0),
+        (1,  256, 0.15, 0.5),
+        (1,  256, 0.20, 1.0),
+    ],
+    "extra-slow-coarse": [
+        # Push the low-res bias even further: 60% at 64×64, 30% at 128, 10% at 256
+        (1,  64,  0.60, 0.0),
+        (1,  128, 0.30, 0.3),
+        (1,  256, 0.10, 1.0),
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Main function — runs locally on CUDA GPU (3090 24 GB)
@@ -79,6 +124,8 @@ def feature_viz(
     n_restarts: int = 5,
     seed: int = 42,
     single_frame: bool = False,
+    stages_preset: str = "progressive",
+    lam_fft_override: float = None,
     cache_dir: str = "./cache",
     out_dir: str = "./outputs",
 ):
@@ -468,21 +515,8 @@ def feature_viz(
     # Helper: single optimization run
     # ==================================================================
 
-    # Progressive resolution stages.  Spatial resolution ramps up
-    # (64 → 128 → 256) then temporal frames ramp up (1 → 8 → ... → 64).
-    # Color blend: 0.0 = grayscale, 1.0 = full color.
-    # Step fractions determine when each transition happens within a
-    # single global cosine LR schedule.
-    STAGES = [
-        # (n_frames, spatial_res, fraction_of_total_steps, color_blend)
-        (1,  64,  0.10, 0.0),   # grayscale, coarse spatial blobs
-        (1,  128, 0.15, 0.0),   # grayscale, mid-frequency spatial
-        (1,  256, 0.15, 0.0),   # grayscale, full spatial detail
-        (8,  256, 0.10, 0.3),   # temporal expansion + introduce color
-        (16, 256, 0.10, 0.6),   # more temporal detail + more color
-        (32, 256, 0.15, 1.0),   # full color, approaching full framerate
-        (64, 256, 0.25, 1.0),   # full color, full framerate refinement
-    ]
+    STAGES = STAGE_PRESETS[stages_preset]
+    print(f"    stages preset: {stages_preset} ({len(STAGES)} stages)")
 
     def _make_init_spectrum(res, n_frames, run_seed):
         """Random spectrum at a given spatial resolution and frame count."""
@@ -733,6 +767,10 @@ def feature_viz(
     # ==================================================================
 
     best_lambda = 1e-3   # fallback if sweep is skipped
+    if lam_fft_override is not None:
+        best_lambda = lam_fft_override
+        print(f"\n>>> λ_fft override: using λ={best_lambda} (skipping sweep) <<<")
+        skip_sweep = True
 
     if not skip_sweep:
         print("\n>>> [4a] Lambda_fft sweep <<<")
@@ -962,6 +1000,11 @@ def main():
                         help="Random seed (restart r uses seed + r*1000)")
     parser.add_argument("--single-frame", action="store_true",
                         help="Optimize a single frame (tiled to 64); ~32× faster")
+    parser.add_argument("--stages-preset", type=str, default="progressive",
+                        choices=list(STAGE_PRESETS.keys()),
+                        help="Stage progression preset")
+    parser.add_argument("--lam-fft", type=float, default=None,
+                        help="Override λ_fft (skips sweep; default 1e-3 if --skip-sweep)")
     parser.add_argument("--cache-dir", type=str, default="./cache",
                         help="Directory for model/dataset caches "
                              "(HuggingFace, freesurfer, tribe features)")
@@ -977,6 +1020,8 @@ def main():
         n_restarts=args.n_restarts,
         seed=args.seed,
         single_frame=args.single_frame,
+        stages_preset=args.stages_preset,
+        lam_fft_override=args.lam_fft,
         cache_dir=args.cache_dir,
         out_dir=args.out_dir,
     )
