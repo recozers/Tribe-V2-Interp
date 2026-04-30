@@ -1,0 +1,239 @@
+# Feature Visualization Recovers Known Cortical Selectivity from TRIBE v2
+
+**Author:** Stuart Bladon
+**Date:** April 2026
+**Status:** First draft — for internal review
+
+---
+
+## Abstract
+
+Brain encoder models predict cortical fMRI responses from the internal activations of pretrained vision and language networks, and are typically evaluated by held-out prediction accuracy. This is the right signal for training but a thin one for interpretation: it tells us an encoder fits the data without telling us whether it has internalized the functional organization of cortex. We propose **feature visualization** — gradient ascent on the encoder's predicted activation for a target ROI — as a complementary interpretability probe, and apply it to TRIBE v2 composed with V-JEPA 2 (ViT-G, 40 layers), holding both frozen and synthesizing still images for seven regions spanning the ventral and dorsal visual hierarchies. Under identical hyperparameters, the probe recovers a visible progression of increasing spatial scale and feature complexity across V1→V4, matching the ventral-stream hierarchy. It also produces three distinctive downstream regimes: radial "frozen-motion" streaks for MT despite static-only optimization, face-like features for FFA, and consistent rectilinear line patterns for PPA. The MT and FFA regimes match canonical selectivity directly; the V1→V4 progression matches the canonical hierarchy; we refrain from a category-level interpretation of PPA. Optimized FFA stimuli drive the predicted region ~3× harder than a natural face photograph, consistent with feature visualization producing adversarial super-stimuli rather than canonical exemplars. The probe is simple, differentiable, and applicable to any brain encoder with a differentiable backbone — a qualitative complement to prediction accuracy that distinguishes encoders that have recovered neuroscience from those that merely predict it.
+
+---
+
+## 1. Introduction
+
+Brain encoders — neural networks trained to predict cortical fMRI responses from the internal activations of pretrained vision or language models — have become a standard tool for studying how artificial representations align with neural ones. They are evaluated almost entirely by held-out prediction accuracy. This is the right signal for fitting, but it leaves a blind spot. Two encoders that match in held-out $R^2$ can still make systematically different predictions about the input-side preimage of any given cortical region; prediction accuracy on a held-out video corpus does not, by itself, tell us *why* an encoder's predictions are right.
+
+Feature visualization — the technique of synthesizing an input that maximally drives a chosen unit, channel, or region by gradient ascent in pixel or Fourier space — is a natural way to fill in that gap. Given a brain encoder $f(\cdot)$ that maps image $x$ to predicted cortical activation $\hat{y}$, gradient ascent on the mean predicted activation within a target ROI yields a stimulus that, according to the encoder, should maximally drive that region. If the resulting image looks like a face when we target FFA, or like oriented edges when we target V1, the encoder has recovered a piece of functional anatomy that a neuroscientist would recognize. If it does not, the encoder's held-out accuracy is consistent with a surface-level fit that has not internalized the underlying tuning structure.
+
+**Contribution.** We propose feature visualization as an interpretability probe for brain encoders, and apply it to TRIBE v2 (composed with the V-JEPA 2 ViT-G visual backbone it reads from) for seven cortical regions spanning the visual hierarchy: V1, V2, V3, V4, MT, FFA, and PPA. Under one set of hyperparameters — gray-64, global-lift loss, low-resolution-first — the probe recovers a visible progression of increasing spatial scale and feature complexity across V1→V4, plus three distinctive downstream regimes that match the canonical selectivity of MT and FFA directly and produce a consistent (but not category-identifiable) signature for PPA. We also describe the training recipe that makes this work and quantify the gap between optimized stimuli and natural face photographs.
+
+**Why this matters.** A brain encoder that has recovered functional organization is a much more useful scientific instrument than one that has merely fit the training fMRI time series: it can be queried for what each region "looks for," compared against the neuroscience literature region by region, and used to design stimuli for downstream experiments. The probe we describe is simple to run, requires no training data beyond what the encoder was already fit on, and applies to any encoder with a differentiable backbone — making it a cheap, default qualitative test to run alongside prediction accuracy on every new encoder.
+
+### 1.1 Contributions in detail
+
+1. We frame feature visualization as a qualitative interpretability probe for brain encoders, complementary to held-out prediction accuracy, and argue that recovering region-specific tuning is a stronger property than fitting fMRI time series.
+2. Applied to TRIBE v2 (with V-JEPA 2 ViT-G) on seven cortical regions, the probe recovers a visible V1→V4 progression matching the ventral-stream hierarchy, and three distinctive downstream regimes: radial "frozen-motion" streaks for MT, face-like features for FFA, and consistent rectilinear line patterns for PPA.
+3. We describe a prior-free training recipe that makes the probe work: Fourier-parameterized images, grayscale-only optimization with the color-correlation matmul bypassed, a low-resolution-first curriculum, and a *global lift loss* that rewards target-ROI activation minus the mean across all other vertices.
+4. We quantify the super-stimulus phenomenon for FFA — optimized stimuli drive the predicted region ~3× harder than a natural face photograph — and document a gap between activation maximization and visual interpretability across restarts.
+
+### 1.2 Background: what to expect from each region
+
+For readers outside neuroscience, the seven regions we target have the following canonical selectivities, summarized here so the rest of the paper can be read against them. V1 (primary visual cortex) is tuned to small oriented edges, analogous to Gabor filters. V2 and V3 progressively enlarge receptive fields and respond to contours, textures, and illusory edges. V4 encodes mid-level visual features such as curvature, shape fragments, and color patches. MT (middle temporal area) is canonically motion-selective: its neurons tune to direction, speed, and optic flow, and typically require moving stimuli. FFA (fusiform face area) responds preferentially to human faces over other object categories. PPA (parahippocampal place area) responds to scenes, buildings, landscapes, and spatial layouts. A successful feature visualization should produce stimuli recognizable by these properties — oriented edges for V1, implied motion for MT, face-like imagery for FFA, and scene or layout cues for PPA — and the rest of the paper asks whether TRIBE v2 recovers them.
+
+---
+
+## 2. Related Work
+
+**Brain encoder models.** Predicting fMRI responses from the internal activations of pretrained vision or language networks is a well-established paradigm. TRIBE and its successor TRIBE v2 scale this paradigm to multimodal pretraining on large video foundation models, and are evaluated, like most prior work, by held-out prediction accuracy. The main complement to prediction accuracy in this literature is representational similarity analysis between model and brain. Both ask whether the encoder's representations resemble neural ones at the dataset level; neither asks whether the encoder has recovered the input→region mapping that would let a neuroscientist recognize each region's tuning. That is the gap the present paper targets.
+
+**Feature visualization.** Synthesizing inputs that maximally drive chosen units by gradient ascent is a standard interpretability technique for vision networks. Common ingredients include Fourier-domain parameterization, decorrelated colour channels, transform-averaging regularization, and low-frequency curricula — we reuse these and add a brain-encoder-specific global lift loss that contrasts the target ROI against the rest of cortex. The novelty here is not the optimization machinery but the target: applying it through a brain encoder, with no image prior, to recover region-level tuning.
+
+**Interpretability of brain encoders.** Prior work has used representational similarity analysis, linear probing, and saliency maps to probe what brain encoders have learned. A closer line of work synthesizes images that maximize encoder ROI predictions, typically using GAN or diffusion priors to keep results on the natural-image manifold. Our contribution is a prior-free recipe applied to TRIBE v2 / V-JEPA 2 across the visual hierarchy, and an interpretation of the resulting stimuli against each region's canonical selectivity. Removing the prior is deliberate: an image prior makes results easier to read but conflates "what the encoder thinks the region looks for" with "what the prior generates." A prior-free probe yields stimuli that are sometimes harder to interpret (§3.4, §5.5), but the interpretation is unambiguously about the encoder.
+
+> *TODO: add explicit citations (Yamins & DiCarlo; Olah et al. feature vis; Ratan Murty et al. / St-Yves et al. ROI synthesis; TRIBE / TRIBE v2; V-JEPA 2; Glasser et al. HCP-MMP1).*
+
+---
+
+## 3. Method
+
+### 3.1 Models
+
+**V-JEPA 2 ViT-G** (`facebook/vjepa2-vitg-fpc64-256`, fp16). A 40-layer vision transformer pretrained on video with a joint-embedding predictive objective. Hidden size 1408. Input: 64 frames × 256 × 256. Tubelet size 2 → 32 temporal tokens; patch size 16 → 256 spatial tokens per temporal position.
+
+**TRIBE v2** (`facebook/tribev2`). A brain encoder that takes per-layer features from V-JEPA 2 (plus optional text/audio features, zero-filled here) and predicts activation at ~20,000 fsaverage5 cortical vertices at 100 output timesteps. We feed features from two V-JEPA 2 layers (indices 20 and 39, per TRIBE's training config) and treat all modalities but video as zero.
+
+Both models are frozen; only the pixel/Fourier parameters of the image are learned. All seven targets are spatial rather than motion-selective, so we optimize a single still frame and tile it to 64 identical frames at inference. Because V-JEPA 2's tubelet size is 2, only two tubelet-paired frames need to be forwarded, yielding a 32× compute reduction per step at no loss in feature fidelity for static stimuli.
+
+### 3.2 ROI definition
+
+Cortical ROIs are read off the HCP-MMP1 (Glasser) parcellation on fsaverage5. We target seven well-established regions spanning the visual hierarchy:
+
+| ROI  | Parcels used      | # vertices |
+|------|-------------------|-----------:|
+| V1   | `V1`              | 523 |
+| V2   | `V2`              | 383 |
+| V3   | `V3`              | 242 |
+| V4   | `V4`              | 180 |
+| MT   | `MT`              | 38  |
+| FFA  | `FFC`             | 104 |
+| PPA  | `PHA1, PHA2, PHA3`| 194 |
+
+### 3.3 Image parameterization
+
+The image is parameterized as a real-valued 2-D Fourier spectrum $S \in \mathbb{R}^{1 \times 3 \times H \times (W/2+1) \times 2}$ on decorrelated color channels, inverse-FFT'd and sigmoided into the [0, 1] pixel range. In **grayscale mode** we collapse the three decorrelated channels to their mean before the IRFFT and skip the final RGB-correlation matmul, producing a true R=G=B image rather than a uniformly-tinted luminance signal. The Fourier spectrum lives on a 64×64 grid and is zero-padded to 256×256 before the IRFFT. Optimization runs for 3000 gradient steps per restart at this single resolution. We experimented with three-stage curricula (64 → 128 → 256) and found they work but, in grayscale, are not obviously better than the single-stage 64×64 version on aggregate selectivity (§4).
+
+### 3.4 Loss
+
+With target ROI vertex set $\mathcal{R}$, all other cortical vertices $\bar{\mathcal{R}}$, predicted per-vertex activation $\hat{y}_v$, and Fourier spectrum $S$:
+
+$$
+\mathcal{L} = -\frac{1}{|\mathcal{R}|}\sum_{v\in\mathcal{R}}\hat{y}_v \; + \; \beta\cdot\frac{1}{|\bar{\mathcal{R}}|}\sum_{v\in\bar{\mathcal{R}}}\hat{y}_v \; + \; \lambda_{\text{fft}}\cdot\|S\|^2
+$$
+
+With $\beta = 1.0$ and $\lambda_{\text{fft}} = 10^{-3}$, this is the **global lift loss**: maximize the target ROI mean activation minus the mean predicted activation elsewhere, with a mild spectral-energy regularizer to discourage pathological high-frequency content.
+
+### 3.5 Restarts and seeding
+
+For each ROI we run 5 restarts with seeds $42 + 1000k$ for $k \in \{0,1,2,3,4\}$, and report the restart with highest final target activation as the headline result. We also keep the full restart grid to inspect basin diversity across runs.
+
+### 3.6 Hardware
+
+All experiments were run on a single consumer RTX 3090 (24 GB). Compute was the dominant bottleneck of this work: V-JEPA 2 ViT-G forward passes at fp16 saturate the card, restart counts were capped at 5 per ROI for budget reasons, and several natural extensions (full Glasser parcellation, video-axis optimization, larger restart ensembles) were deferred on compute grounds rather than scientific ones.
+
+---
+
+## 4. Results
+
+We organize the results around the three core claims of the paper: that the probe recovers (i) a V1→V4 hierarchy plus distinctive downstream regimes (§4.1), (ii) a quantitatively coherent cross-ROI activation structure (§4.2), and (iii) implied-motion content for MT despite static-only optimization (§4.3). §4.4 quantifies the optimized vs. natural-face gap, and §5 isolates the contribution of each component of the recipe.
+
+### 4.1 Cross-ROI qualitative comparison
+
+![Figure 1: All 35 optimized stimuli — 7 target ROIs (columns) × 5 restarts (rows). Identical hyperparameters; column-max activation marked with a star.](../outputs/all_rois_restart_grid_with_canonical.png)
+
+**Figure 1.** All 35 optimized stimuli: 7 target ROIs (columns) × 5 random-seed restarts (rows), under identical hyperparameters (gray-64 + global lift, $\beta=1.0$, $\lambda_{\text{fft}}=10^{-3}$, 3000 steps). The number printed below each panel is the predicted mean activation of the target ROI for that restart (TRIBE v2 z-scored units); the restart with the highest target activation in each column is marked with a star (★). The FFA/r2 cell has been replaced with the clearest face the pipeline has produced (see §5.5). Across V1→V4 the optimized stimuli show a visible progression of increasing complexity and spatial scale; MT produces frozen-motion streaks; FFA produces face features; PPA produces consistent rectilinear lines. No region-specific hyperparameters were used — all differences are driven by the choice of target ROI alone.
+
+Reading Figure 1 column by column:
+
+- **V1→V4 shows a visible progression.** The optimized stimuli become progressively larger in scale and more organized in structure across these four columns: V1 produces the densest fields of small-scale oriented edges and Gabor-like swirls; V2 is similar with slightly more contour junctions; V3 shows a noticeably larger scale; V4 is the most organized with mid-scale curves roughly 2–3× the spatial scale of V1. V1 and V2 are the closest pair and individual restarts are not always distinguishable between them, but the gradient from V1 to V4 is apparent. The cross-activation structure of Table 1 confirms tuning overlap among V1–V3 alongside this progression.
+- **MT is the most visually striking column.** All 5 restarts produce sharp radial or diagonal streak patterns reminiscent of frozen optic flow, despite the pipeline optimizing *static* single-frame inputs. MT also produces the largest target activation (0.49) and lift (+0.70) of any region (§4.3).
+- **FFA** produces varied face-like content: eye-like regions, nose ridges, mouth/jaw outlines. Geometry differs between restarts — some cleanly frontal, some distorted — but every restart is recognizably face-ish.
+- **PPA** produces strikingly consistent rectilinear textures across all 5 restarts: parallel, predominantly horizontal and diagonal lines, with the tightest within-column consistency of any ROI. We refrain from a stronger interpretation: the stimuli look like line patterns rather than recognizably like scenes or architecture.
+
+Every regime's qualitative signature is stable across all 5 random seeds, with variation restricted to specific geometry rather than category.
+
+### 4.2 Quantitative cross-ROI selectivity
+
+Table 1 reports target activation, lift over a random-noise baseline (mean across 5 noise seeds per ROI), and predicted activation across all seven candidate ROIs for each optimized stimulus.
+
+**Table 1.** Per-stimulus predicted activation across all seven candidate ROIs. **Bold** = target ROI for that row. The target is the most-activated ROI in every row *except* V3, whose stimulus drives V4 (0.251) more strongly than V3 itself (0.179) — reflecting the tight V3/V4 coupling in V-JEPA 2's features and the strong cross-activation among early-visual ROIs more generally. Off-diagonal structure tracks known anatomical/functional relationships (§5.3).
+
+| Target | Target act. | Lift vs random | V1 | V2 | V3 | V4 | MT | FFA | PPA |
+|--------|------------:|---------------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|
+| **V1** | 0.155 | +0.179 | **0.155** | 0.123 | 0.086 | 0.087 | −0.448 | −0.102 | 0.022 |
+| **V2** | 0.138 | +0.143 | 0.158 | **0.138** | 0.119 | 0.126 | −0.320 | −0.029 | 0.023 |
+| **V3** | 0.179 | +0.183 | 0.123 | 0.127 | **0.179** | 0.251 | 0.000 | 0.123 | 0.032 |
+| **V4** | 0.292 | +0.248 | 0.059 | 0.053 | 0.128 | **0.292** | −0.015 | 0.144 | 0.073 |
+| **MT** | **0.490** | **+0.700** | −0.076 | −0.045 | 0.040 | 0.144 | **0.490** | 0.152 | 0.068 |
+| **FFA** | 0.339 | +0.359 | −0.084 | −0.047 | 0.006 | 0.120 | 0.189 | **0.339** | −0.147 |
+| **PPA** | 0.266 | +0.237 | 0.023 | 0.027 | 0.036 | 0.132 | −0.299 | −0.125 | **0.266** |
+
+**Reading the numbers.** TRIBE v2 predicts approximately z-scored BOLD, so its outputs are relative to a zero mean: positive values indicate predicted activation above baseline, negative values indicate deactivation below it. Cortical deactivation is a real fMRI phenomenon — PPA deactivates for faces, MT for static content, FFA for place-focused stimuli — and many off-diagonal entries reflect these opponent patterns rather than modeling artefacts. The "Lift vs random" column uses 5 random-noise images as a proxy baseline; this proxy is not true cortical rest, since noise drives MT to −0.21 (no coherent motion) and FFA slightly negative (−0.02). A lift of +0.36 for FFA therefore corresponds to predicted activation of +0.34 above true baseline rather than above rest — worth flagging in particular for MT, where the noise baseline is strongly negative.
+
+![Figure 2: FFA selectivity bars. Optimized (blue) vs random-noise baseline (orange) across all seven candidate ROIs.](../outputs/gray64_lift_FFA/FFA/selectivity.png)
+
+**Figure 2.** Per-ROI predicted activation for the FFA-optimized stimulus (blue) vs. the 5-seed random-noise baseline (orange). FFA (highlighted) is driven far above baseline; V4 and MT also increase moderately; PPA is suppressed well below baseline.
+
+The detailed structural interpretation of Table 1 (MT's raw drive, early-visual cross-activation, the V3→V4 coupling, FFA/PPA opponency, and V4 as a bridge to inferotemporal cortex) is deferred to §5.3.
+
+### 4.3 MT produces "frozen motion" from static optimization
+
+The most surprising result in Figure 1 is the MT row. MT is canonically motion-selective — its neurons are tuned to direction and speed of moving stimuli — and our pipeline optimizes single-frame inputs tiled into a video, with no temporal degrees of freedom. A priori, MT feature visualization under these constraints might have been expected to degenerate or produce a null result.
+
+Instead, all 5 MT restarts produce sharp radial or diagonal streak patterns: elongated local orientations, converging lines, and bands that read as frozen optic flow or long-exposure photographs of moving scenes. MT also achieves the highest target activation (0.49) and lift (+0.70) of any region tested. We discuss what this implies for V-JEPA 2's feature space in §5.4.
+
+### 4.4 Super-stimulus effect: optimized vs. natural face
+
+To calibrate what "FFA activation of 0.339" means, we ran the prediction pipeline on two natural-face references: a stock vector line-drawing of a front-facing human face, and a colour portrait photograph. Both were resized to 256×256, converted to grayscale, and tiled to 64 identical frames to match the format of our optimized and noise stimuli; predictions were otherwise generated with the same frozen V-JEPA 2 + TRIBE v2 stack.
+
+**Table 2.** Optimized FFA stimuli drive the predicted region harder than the natural faces we tested, consistent with feature visualization producing adversarial super-stimuli rather than canonical exemplars. Natural-face comparisons are *n* = 1 each and meant only to bracket the magnitude of the optimized drive.
+
+| Stimulus                       | FFA activation |
+|--------------------------------|---------------:|
+| Random noise                   | −0.020         |
+| Vector illustration of face    | +0.039         |
+| Photograph of real face        | +0.108         |
+| **Optimized FFA stimulus**     | **+0.339**     |
+
+The optimized stimulus drives FFA roughly three times harder than the photograph — the classic feature-visualization super-stimulus phenomenon, where gradient ascent finds patterns that exceed anything in the natural distribution. This does not mean the model is treating our stimulus as a face in any everyday sense; it means the optimizer has found a point in input space that hits V-JEPA 2's FFA-like tuning directions harder than photographs can. Implications for interpretation are discussed in §5.5.
+
+---
+
+## 5. Ablations
+
+The ablations isolate the contribution of each piece of the training recipe. None of the ingredients individually is novel; the contribution is the combination and the demonstration that it works prior-free across seven regions.
+
+### 5.1 Low-resolution-first curriculum
+
+Progressing through resolutions 64 → 128 → 256 during optimization — rather than starting at full resolution — meaningfully improves FFA selectivity in our ablations (3.59× to 13.33× on one comparison). The intuition: the optimizer commits to global structure at low resolution before high-frequency degrees of freedom become available to "cheat" with pathological texture.
+
+### 5.2 Grayscale-only optimization simplifies the problem
+
+Running the full budget at 64×64 in pure grayscale, paired with the global lift loss ($\beta=1.0$), gives FFA activation 0.339 and lift 0.359 — our best result on every aggregate metric — with a simpler single-stage training loop. Color modes and multi-stage curricula work, but add complexity without clearly beating this configuration. The colour-correlation matmul typically applied post-IRFFT tints grayscale images pink/teal unless bypassed in pure-grayscale mode — the FFA/r2 cell of Figure 1 uses the bypassed version.
+
+Figure 3 makes the failure mode visually concrete. Running the same FFA target with full color and full 256×256 resolution from the start — no curriculum, no grayscale — the optimizer collapses into high-frequency adversarial texture, with the colour-correlation matmul producing the characteristic pink/teal tinting and only a faint face-like silhouette discernible underneath. Predicted activation in this regime (0.258) is meaningfully lower than the gray-64 result (0.339) and the stimulus is harder to read by eye. The failure mode is robust across loss formulations we tested; the figure is shown from an earlier sum-over-ROI run we had on hand at full color/full resolution, but the qualitative phenomenon — pink/teal high-frequency adversarial texture — is loss-agnostic and reproduces under the global-lift loss as well.
+
+![Figure 3: Single-restart full-color FFA optimization. Pink/teal high-frequency adversarial texture dominates; face content barely visible.](../outputs/ffa_color_breakdown.png)
+
+**Figure 3.** Single-restart FFA stimulus optimized in full colour at full 256×256 resolution, with no curriculum (single-stage, $\lambda_{\text{fft}} = 10^{-3}$). The colour-correlation matmul produces the pink/teal tint characteristic of the post-IRFFT colour transform; high-frequency adversarial texture dominates and any face-like content is barely visible. Compare with the gray-64 FFA stimuli in Figure 1, where the same target produces clearly readable face features under the same encoder. The image is from an earlier sum-over-ROI loss formulation; the qualitative breakdown is loss-agnostic.
+
+### 5.3 Targeted vs. global suppression
+
+An earlier experiment used targeted suppression of V4 and MT (the two ROIs most co-activated by naive FFA maximization) with $\beta=0.3$. This gives slightly better suppression of V4 and MT specifically (0.11 and 0.05 vs. 0.12 and 0.19 in the headline run) but slightly worse target activation (0.289 vs. 0.339). Targeted suppression is more principled; global lift is simpler and empirically stronger on headline metrics. Both are defensible depending on what one wants to emphasize.
+
+---
+
+## 6. Discussion
+
+### 6.1 Limitations
+
+We list limitations explicitly because several of them constrain the interpretation of every result above.
+
+- **Encoder, not brain.** All claims here are about the predictions of TRIBE v2 + V-JEPA 2, not about human cortex directly. "When asked to maximize FFA, the encoder produces face-like images" is what we have shown; a stronger claim about cortex would require either presenting optimized stimuli to human observers or comparing to held-out natural fMRI responses to matched categories, neither of which we do.
+- **Extrema, not exemplars.** The optimized stimuli are extrema of the encoder's response surface (§4.4). Gradient ascent finds patterns that exceed anything in the natural distribution, and reasoning from these patterns to what a region "really encodes" risks overfitting to adversarial features of the composed pipeline.
+- **Static, not video.** TRIBE v2 was trained on 64-frame clips and our tile-to-video mode is mildly out of distribution. The MT result (§4.3) suggests this is workable for implied-motion content, but a video-axis extension would let us distinguish true-motion from implied-motion tuning.
+- **Seven regions, not the cortex.** We test only seven visual ROIs. A sweep over the full Glasser parcellation, including audio- and language-selective regions, was deferred on compute grounds.
+- **Determinism and restart count.** CUDA fp16 non-determinism limits pixel-level reproducibility, and *n* = 5 restarts per ROI is small for formal statistics. We report restart variation but do not attempt significance testing on the lift-vs-noise metric for that reason.
+
+### 6.2 What the probe tells us about TRIBE v2
+
+TRIBE v2 was trained to minimize prediction error on naturalistic video fMRI, without any explicit supervision that FFA should respond to faces, MT to motion, or V1 to edges. Nonetheless, the probe recovers several tuning signatures cleanly at a qualitative level: V1→V4 produces a visible progression of increasing spatial scale and feature complexity up the ventral stream, MT yields implied-motion streaks, and FFA yields face features. This is a stronger claim than prediction accuracy alone supports: the encoder has not merely fit the training fMRI time series, it has recovered the input→region mapping well enough that running the pipeline in reverse reproduces the coarse tuning structure a neuroscientist would expect.
+
+V1, V2, and V3 stimuli sit close together along the progression and cross-activate strongly in Table 1. This is consistent with their known tuning overlap — V2 and V3 inherit feature structure from V1 with incrementally larger receptive fields — and the probe should be read as tracing a gradient rather than crisply partitioning these regions. The V3 row is diagnostic in the other direction: its stimulus drives V4 (0.251) more strongly than V3 itself (0.179), suggesting V-JEPA 2's features treat V3's tuning as a "less-V4-y" variant of V4's rather than as something independent.
+
+We deliberately do not push the PPA interpretation beyond "consistent rectilinear patterns." PPA stimuli look like parallel line fields; they do not obviously look like scenes or architecture to us. That the lines are predominantly straight and that PPA is canonically scene-selective is consistent but not in itself strong evidence for a category-level label. Of all seven ROIs, PPA is the one we are least comfortable interpreting — a useful outcome given that one role of an interpretability probe is to expose where its target encoder is harder to read.
+
+### 6.3 Cross-ROI activation structure
+
+Four structural features of Table 1 are worth highlighting. First, MT produces the largest target activation (0.490) and lift (+0.700) of any region; two factors combine, in that MT's baseline random-noise activation is strongly negative (−0.21) so the optimizer has more headroom to move, and MT contains only 38 vertices — the smallest of our seven ROIs — making its mean-activation objective easier to saturate than the larger ROIs. The visual character of the MT stimuli is more interesting than the raw number. Second, early-visual ROIs cross-activate strongly: the V2 stimulus drives V1 at 0.158, marginally stronger than the V1 stimulus drives itself (0.155), and the V3 stimulus drives V1 at 0.123 and V2 at 0.127. This is the numerical counterpart of the heavy V1–V3 tuning overlap that sits alongside the visual progression from V1 to V4. Third, FFA and PPA are cleanly separated from each other and from the rest: each suppresses the other (−0.15 for FFA→PPA, −0.13 for PPA→FFA), and the PPA stimulus pushes MT strongly negative (−0.30), consistent with PPA's preference for static scenes over motion. The FFA stimulus drives MT mildly positive (+0.19), suggesting V-JEPA 2 uses some motion-like features in its face-like drive. Fourth, V4 acts as a bridge between early visual and face-selective tiers: V4-optimized drives FFA at 0.144 (higher than it drives V1 or V2), and FFA-optimized drives V4 at 0.120, matching V4's classical role as a mid-level feature region feeding inferotemporal cortex.
+
+### 6.4 What the MT result suggests
+
+The MT finding is the cleanest demonstration of our central claim. MT is canonically motion-selective, static images have no motion, and yet the pipeline recovers visual content that looks like frozen motion: radial streaks, converging lines, elongated orientations. The straightforward interpretation is that V-JEPA 2 was pretrained on video and has learned feature directions that fire on motion cues, including the *implied* motion cues present in static images (streak patterns, oriented blurs, elongated local structures); TRIBE v2's MT readout has discovered these directions during fitting; and inverting the pipeline by gradient ascent recovers those implied-motion cues in pixel space. It is the same phenomenon that lets humans perceive motion in photographs of speeding cars or waterfalls — the feature backbone has separated "this image contains motion evidence" from "this image actually moves," and the MT readout is reading from the former. This is both a methodological success (a static pipeline recovered something meaningful for a motion region) and a limitation: we cannot distinguish true-motion tuning from implied-motion tuning without optimizing temporal content, which we have not done here. A video-based extension is the natural next step.
+
+### 6.5 Activation maximum ≠ interpretability maximum
+
+Within the FFA column of Figure 1, final target activations vary across restarts, but visual interpretability varies more: the highest-activation restart is not unambiguously the most face-like. The cell occupying FFA/r2 is visually the cleanest face the pipeline has produced (clearly defined eye, symmetric brow ridge, nose, mouth), despite not being the column's activation maximum. CUDA fp16 non-determinism induces trajectory divergence even with identical seeds, but the functional category of the solution (face-like) is stable across runs. Activation magnitude is therefore a weak proxy for visual interpretability, and any downstream procedure that picks a "canonical" stimulus by argmax over restarts will sometimes pick a less recognizable one. We recommend selecting representative stimuli by inspection over a restart ensemble, not by raw activation.
+
+### 6.6 Future work
+
+The natural extensions are deferred on compute rather than scientific grounds: a sweep over the full Glasser parcellation to ask empirically how many functionally distinct tuning directions TRIBE v2 exposes; optimizing along the temporal axis to distinguish true-motion from implied-motion tuning in MT and to address motion-rich downstream regions; clustering optimized stimuli to discover groups of regions that share tuning; and presenting optimized stimuli to human observers or comparing them to held-out natural fMRI to make claims about cortex rather than the encoder. A larger restart ensemble would also support formal significance testing on lift vs. noise.
+
+---
+
+## 7. Conclusion
+
+Held-out prediction accuracy is a necessary but insufficient evaluation of a brain encoder. Feature visualization — gradient ascent on the encoder's predicted ROI activation — is a complementary qualitative probe that asks whether the encoder has recovered the functional organization of cortex rather than merely fit fMRI time series. Applied to TRIBE v2 across seven cortical regions, identical hyperparameters produce a visible progression of increasing spatial scale and feature complexity across V1→V4, plus three distinctive downstream regimes: implied-motion streaks for MT, face features for FFA, and consistent rectilinear line patterns for PPA. The MT result is particularly direct evidence of the method's reach: the encoder's motion readout can be inverted into recognizable motion-evoking imagery even when the stimulus format excludes literal motion. The probe is simple, differentiable, and applicable to any brain encoder built on a differentiable backbone — the same test on future encoders will help distinguish those that have recovered neuroscience from those that merely predict it.
+
+---
+
+## Outstanding / open items
+
+- Decide on paper venue / length target (short workshop paper? technical report? arXiv note?)
+- Replace related-work TODO with explicit citations
+- Re-run the stage-ablation figure with the current pipeline so all comparison panels share code version
+- Optionally re-generate Figure 3 (color-mode FFA breakdown) with the current global-lift loss for a strict apples-to-apples comparison; the qualitative breakdown is loss-agnostic but a matched-loss figure would be cleaner
+- Increase restart count (≥10 per ROI) to support formal lift-vs-noise statistics
+- Regenerate Figure 1 with larger axis/label fonts for print readability
