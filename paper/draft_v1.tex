@@ -5,14 +5,14 @@
 \usepackage{subcaption}
 \usepackage{booktabs}
 \usepackage{hyperref}
+\usepackage{afterpage}
 
 \newcommand{\theHalgorithm}{\arabic{algorithm}}
 
-\usepackage{icml2026}
+\usepackage[preprint]{icml2026}
 
 \makeatletter
-\renewcommand{\Notice@String}{Preliminary work. Under review at the
-ICML 2026 Workshop on Mechanistic Interpretability. Do not distribute.}
+\renewcommand{\Notice@String}{Preprint. Submitted to the ICML 2026 Workshop on Mechanistic Interpretability.}
 \makeatother
 
 \usepackage{amsmath}
@@ -28,11 +28,12 @@ ICML 2026 Workshop on Mechanistic Interpretability. Do not distribute.}
 \icmltitle{Feature Visualization Recovers Known\\ Cortical Selectivity from TRIBE v2}
 
 \begin{icmlauthorlist}
-\icmlauthor{}{anon}
+\icmlauthor{Stuart Bladon}{duke}
+\icmlauthor{Brinnae Bent}{duke}
 \end{icmlauthorlist}
 
-\icmlaffiliation{anon}{}
-\icmlcorrespondingauthor{}{}
+\icmlaffiliation{duke}{Duke University, Durham, NC, USA}
+\icmlcorrespondingauthor{Stuart Bladon}{stuartbladon@icloud.com}
 
 \icmlkeywords{brain encoders, feature visualization, mechanistic interpretability, fMRI, TRIBE, V-JEPA}
 
@@ -62,7 +63,7 @@ The seven regions we target have the following canonical selectivities, summariz
 
 \paragraph{Brain encoder models.} Predicting fMRI responses from the internal activations of pretrained vision or language networks is a well-established paradigm \citep{yamins2016goaldriven,schrimpf2020brainscore}. TRIBE \citep{tribev1} and its successor TRIBE v2 \citep{tribev2} scale this paradigm to multimodal pretraining on large video foundation models, and are evaluated, like most prior work, by held-out prediction accuracy. The main complement to prediction accuracy in this literature is representational similarity analysis between model and brain. Both ask whether the encoder's representations resemble neural ones at the dataset level, leaving open the input-side question of what each region prefers.
 
-\paragraph{Feature visualization.} Synthesizing inputs that maximally drive chosen units by gradient ascent is a standard interpretability technique for vision networks \citep{erhan2009visualizing,simonyan2013deep,olah2017featurevis}. Common ingredients include Fourier-domain parameterization, decorrelated colour channels, transform-averaging regularization, and low-frequency curricula \citep{olah2017featurevis}. These recipes were developed for unit- or channel-level objectives in image classifiers; their behaviour when applied to whole-brain fMRI encoders --- whose targets are pooled across thousands of cortical vertices and whose backbones are video, not image, models --- is largely unstudied.
+\paragraph{Feature visualization.} Synthesizing inputs that maximally drive chosen units by gradient ascent is a standard interpretability technique for vision networks \citep{erhan2009visualizing,simonyan2013deep,olah2017featurevis}. Common components include Fourier-domain parameterization, decorrelated colour channels, transform-averaging regularization, and low-frequency curricula \citep{olah2017featurevis}. These recipes were developed for unit- or channel-level objectives in image classifiers; their behaviour when applied to whole-brain fMRI encoders --- whose targets are pooled across thousands of cortical vertices and whose backbones are video, not image, models --- is largely unstudied.
 
 \paragraph{Interpretability of brain encoders.} Prior work has used representational similarity analysis, linear probing, and saliency maps to probe what brain encoders have learned. A closer line of work synthesizes images that maximize encoder ROI predictions \citep{walker2019inception,bashivan2019neural,ponce2019evolving,ratanmurty2021computational}, typically using GAN or diffusion priors to keep results on the natural-image manifold. While priors make resulting stimuli easier to read, they also confound regional selectivity with prior guidance: a face-shaped output may reflect the GAN's face manifold rather than the encoder's face tuning. A prior-free probe across the full visual hierarchy of a modern multimodal video encoder is, to our knowledge, missing from the literature.
 
@@ -80,7 +81,7 @@ Both models are frozen; only the pixel/Fourier parameters of the image are learn
 Cortical ROIs are read off the HCP-MMP1 \citep{glasser2016multimodal} parcellation on fsaverage5. The HCP-MMP1 parcels for V1, V2, V3, V4, and MT each map directly to a single eponymous parcel (with 523, 383, 242, 180, and 38 vertices respectively); FFA is taken as the \texttt{FFC} parcel (104 vertices); and PPA is the union of \texttt{PHA1}, \texttt{PHA2}, and \texttt{PHA3} (194 vertices).
 
 \subsection{Image parameterization}
-The image is parameterized as a real-valued 2-D Fourier spectrum $S \in \mathbb{R}^{1 \times 3 \times H \times (W/2+1) \times 2}$ on decorrelated colour channels. We apply the inverse real fast Fourier transform (IRFFT) and a sigmoid to map the spectrum into the $[0,1]$ pixel range. In \emph{grayscale mode} we collapse the three decorrelated channels to their mean before the IRFFT and skip the final RGB-correlation matmul, producing a true $\mathrm{R}=\mathrm{G}=\mathrm{B}$ image. The Fourier spectrum lives on a $64\times64$ grid and is zero-padded to $256\times256$ before the IRFFT. Optimization runs for 3000 gradient steps per restart at this single resolution; ablations at higher resolutions and with three-stage curricula are reported in Appendix~\ref{app:ablations}.
+The image is parameterized as a real-valued 2-D Fourier spectrum $S \in \mathbb{R}^{1 \times 3 \times H \times (W/2+1) \times 2}$ on decorrelated colour channels. We apply the inverse real fast Fourier transform (IRFFT) and a sigmoid to map the spectrum into the $[0,1]$ pixel range. In \emph{grayscale mode} we collapse the three decorrelated channels to their mean before the IRFFT and skip the final RGB-correlation matmul, producing a true $\mathrm{R}=\mathrm{G}=\mathrm{B}$ image. The Fourier spectrum is defined on a $64\times64$ grid and zero-padded to $256\times256$ before the IRFFT. Optimization runs for 3000 gradient steps per restart at this single resolution; ablations at higher resolutions and with three-stage curricula are reported in Appendix~\ref{app:ablations}.
 
 \subsection{Loss}
 With target ROI vertex set $\mathcal{R}$, all other cortical vertices $\bar{\mathcal{R}}$, predicted per-vertex activation $\hat{y}_v$, and Fourier spectrum $S$:
@@ -90,14 +91,15 @@ With target ROI vertex set $\mathcal{R}$, all other cortical vertices $\bar{\mat
 With $\beta = 1.0$ and $\lambda_{\text{fft}} = 10^{-3}$, this is the \textbf{global lift loss}: maximize the target ROI mean activation minus the mean predicted activation elsewhere, with a mild spectral-energy regularizer to discourage pathological high-frequency content. We chose this objective because naive ROI maximization (the target term alone) tends to produce stimuli that drive many regions simultaneously rather than the target specifically: TRIBE v2's per-vertex predictions are correlated across nearby ROIs, so an unconstrained optimum exploits that shared variance. Subtracting mean activation over the rest of cortex penalizes solutions whose drive is generic, encouraging directions that are selective rather than merely large. The spectral-energy term is a mild regularizer against pathological high-frequency texture; $\lambda_{\text{fft}} = 10^{-3}$ was the smallest value at which we observed visible suppression of such textures without affecting low-frequency structure.
 
 \subsection{Restarts and evaluation}
-For each ROI we run 5 restarts with seeds $42 + 1000k$ for $k \in \{0,1,2,3,4\}$. We evaluate each restart by its \emph{final target activation} --- the mean of the encoder's predicted activation over the target ROI vertices at the last optimization step --- and treat the restart with the highest final target activation in each ROI column as the \emph{headline result} for the cross-ROI activation tables (Table~\ref{tab:selectivity}). The full restart grid is retained to inspect basin diversity across runs and is shown alongside the headline cells in Figure~\ref{fig:all-rois-grid}. As a baseline we also run the prediction pipeline on 5 random-noise images per ROI; the gap between the optimized stimulus's target activation and this 5-seed noise mean is reported as the \emph{lift}.
+\label{sec:eval}
+For each ROI we run 5 restarts with seeds $42 + 1000k$ for $k \in \{0,1,2,3,4\}$. We evaluate each restart by its \emph{final target activation} --- the mean of the encoder's predicted activation over the target ROI vertices at the last optimization step --- and treat the restart with the highest final target activation in each ROI column as the \emph{primary result} for the cross-ROI activation tables (Table~\ref{tab:selectivity}). The full restart grid is retained to inspect basin diversity across runs and is shown alongside the primary cells in Figure~\ref{fig:all-rois-grid}. As a baseline we also run the prediction pipeline on 5 random-noise images per ROI; the gap between the optimized stimulus's target activation and this 5-seed noise mean is reported as the \emph{lift}.
 
 \subsection{Hardware}
 All experiments were run on a single consumer RTX 3090 (24\,GB). Compute was the dominant bottleneck of this work: V-JEPA 2 ViT-G forward passes at fp16 saturate the card, restart counts were capped at 5 per ROI for budget reasons, and several natural extensions (full Glasser parcellation, video-axis optimization, larger restart ensembles) were deferred on compute grounds rather than scientific ones.
 
 \section{Results}
 
-The headline result is the cross-ROI grid of optimized stimuli (\S\ref{sec:cross-roi}): a visible V1$\to$V4 progression, and MT, FFA, and PPA each produce a distinctive signature. \S\ref{sec:quant} reports the corresponding cross-ROI activation matrix; \S\ref{sec:mt-frozen-motion} isolates the MT case, where static-only optimization still recovers implied-motion content; \S\ref{sec:superstim} quantifies the gap to a natural face photograph.
+The primary result is the cross-ROI grid of optimized stimuli (\S\ref{sec:cross-roi}): a visible V1$\to$V4 progression, and MT, FFA, and PPA each produce a distinctive signature. \S\ref{sec:quant} reports the corresponding cross-ROI activation matrix; \S\ref{sec:mt-frozen-motion} isolates the MT case, where static-only optimization still recovers implied-motion content; \S\ref{sec:superstim} quantifies the gap to a natural face photograph.
 
 \subsection{Cross-ROI qualitative comparison}
 \label{sec:cross-roi}
@@ -126,9 +128,9 @@ Every regime's qualitative signature is stable across all five random seeds, wit
 
 Table~\ref{tab:selectivity} reports target activation, lift over a random-noise baseline (mean across 5 noise seeds per ROI), and predicted activation across all seven candidate ROIs for each optimized stimulus.
 
-\begin{table*}[tbp]
+\begin{table*}[!t]
 \centering
-\caption{Per-stimulus predicted activation across all seven candidate ROIs. \textbf{Bold} = target ROI for that row. The target is the most-activated ROI in every row \emph{except} V3, whose stimulus drives V4 (0.251) more strongly than V3 itself (0.179) --- reflecting the tight V3/V4 coupling in V-JEPA~2's features and the strong cross-activation among early-visual ROIs more generally. Off-diagonal structure tracks known anatomical/functional relationships (\S\ref{sec:discussion-cross-roi}).}
+\caption{Per-stimulus predicted activation across all seven candidate ROIs. \emph{Target act.} is the mean predicted activation over the target ROI vertices for the optimized stimulus (the ``final target activation'' of \S\ref{sec:eval}); \emph{Lift vs random} is that value minus the 5-seed random-noise baseline activation in the same ROI; remaining columns give predicted activation in each candidate ROI under the same stimulus. \textbf{Bold} = target ROI for that row. The target is the most-activated ROI in every row \emph{except} V3, whose stimulus drives V4 (0.251) more strongly than V3 itself (0.179) --- reflecting the tight V3/V4 coupling in V-JEPA~2's features and the strong cross-activation among early-visual ROIs more generally. Off-diagonal structure tracks known anatomical/functional relationships (\S\ref{sec:discussion-cross-roi}).}
 \label{tab:selectivity}
 \small
 \begin{tabular}{lrr|rrrrrrr}
@@ -146,28 +148,28 @@ Target & Target act. & Lift vs random & V1 & V2 & V3 & V4 & MT & FFA & PPA \\
 \end{tabular}
 \end{table*}
 
-TRIBE v2 predicts approximately z-scored BOLD, so its outputs are relative to a zero mean: positive values indicate predicted activation above baseline, negative values indicate deactivation below it. PPA deactivates for faces, FFA for place-focused stimuli. The ``Lift vs random'' column uses 5 random-noise images as a proxy baseline; this proxy is not true cortical rest, since noise drives MT to $-0.21$ (no coherent motion) and FFA slightly negative ($-0.02$). A lift of $+0.36$ for FFA therefore corresponds to predicted activation of $+0.34$ above true baseline rather than above rest; this is of particular note for MT, where the noise baseline is strongly negative.
+TRIBE v2 predicts approximately z-scored blood-oxygen-level-dependent (BOLD) signal, so its outputs are relative to a zero mean: positive values indicate predicted activation above baseline, negative values indicate deactivation below it. PPA deactivates for faces, FFA for place-focused stimuli. The ``Lift vs random'' column uses 5 random-noise images as a proxy baseline; this proxy is not true cortical rest, since noise drives MT to $-0.21$ (no coherent motion) and FFA slightly negative ($-0.02$). A lift of $+0.36$ for FFA therefore corresponds to predicted activation of $+0.34$ above true baseline rather than above rest; this is of particular note for MT, where the noise baseline is strongly negative.
 
-\begin{figure}[tbp]
+\begin{figure*}[!t]
     \centering
-    \includegraphics[width=0.9\linewidth]{gray64_lift_FFA/FFA/selectivity.png}
+    \includegraphics[width=0.7\linewidth]{gray64_lift_FFA/FFA/selectivity.png}
     \caption{Per-ROI predicted activation for the FFA-optimized stimulus (blue) vs.\ the 5-seed random-noise baseline (orange). FFA (highlighted) is driven far above baseline; V4 and MT also increase moderately; PPA is suppressed well below baseline.}
     \label{fig:selectivity}
-\end{figure}
+\end{figure*}
 
 \subsection{MT produces ``frozen motion'' from static optimization}
 \label{sec:mt-frozen-motion}
 
-The most surprising result in Figure~\ref{fig:all-rois-grid} is the MT row. MT is canonically motion-selective --- its neurons are tuned to direction and speed of moving stimuli --- and our pipeline optimizes single-frame inputs tiled into a video, with no temporal degrees of freedom. A priori, MT feature visualization under these constraints might have been expected to degenerate or produce a null result.
+The most surprising result in Figure~\ref{fig:all-rois-grid} is the MT row. MT is canonically motion-selective --- its neurons are tuned to direction and speed of moving stimuli --- and our pipeline optimizes single-frame inputs tiled into a video, with no temporal degrees of freedom. \emph{A priori}, MT feature visualization under these constraints might have been expected to degenerate or produce a null result.
 
 Instead, all five MT restarts produce sharp radial or diagonal streak patterns: elongated local orientations, converging lines, and bands that read as frozen optic flow or long-exposure photographs of moving scenes. MT also achieves the highest target activation (0.49) and lift ($+0.70$) of any region tested.
 
 \subsection{Super-stimulus effect: optimized vs.\ natural face}
 \label{sec:superstim}
 
-As a reference frame for our activations, we ran the prediction pipeline on two natural-face references: a stock vector line-drawing of a front-facing human face, and a colour portrait photograph. Both were resized to $256\times256$, converted to grayscale, and tiled to 64 identical frames to match the format of our optimized and noise stimuli; predictions were otherwise generated with the same frozen V-JEPA~2 + TRIBE v2 stack. Table~\ref{tab:superstim} reports the headline gray-64 number ($+0.339$); Figure~\ref{fig:face-and-color} displays the color-64 ablation variant ($+0.343$) alongside the natural-face reference, since the colour version is more visually interpretable as a face --- see \S\ref{sec:grayscale} for why both are reported.
+As a reference frame for our activations, we ran the prediction pipeline on two natural-face references: a stock vector line-drawing of a front-facing human face, and a colour portrait photograph. Both were resized to $256\times256$, converted to grayscale, and tiled to 64 identical frames to match the format of our optimized and noise stimuli; predictions were otherwise generated with the same frozen V-JEPA~2 + TRIBE v2 stack. Table~\ref{tab:superstim} reports the primary gray-64 number ($+0.339$); Figure~\ref{fig:face-and-color} displays the color-64 ablation variant ($+0.343$) alongside the natural-face reference, since the colour version is more visually interpretable as a face --- see \S\ref{sec:grayscale} for why both are reported.
 
-\begin{table}[tbp]
+\begin{table}[!t]
 \centering
 \caption{Optimized FFA stimuli drive the predicted region harder than the natural faces we tested, consistent with feature visualization producing adversarial super-stimuli rather than canonical exemplars. Natural-face comparisons are $n=1$ each and meant only to bracket the magnitude of the optimized drive.}
 \label{tab:superstim}
@@ -183,29 +185,29 @@ Photograph of real face        & $+0.080$       \\
 \end{tabular}
 \end{table}
 
-\begin{figure}[tbp]
+\begin{figure*}[!t]
     \centering
-    \begin{subfigure}[b]{0.30\linewidth}
+    \begin{subfigure}[b]{0.22\linewidth}
         \centering
         \includegraphics[width=\linewidth]{real_face_paper_256.jpg}
-        \caption{Natural face photograph, FFA $= +0.080$.}
+        \caption{$+0.080$}
         \label{fig:real-face}
     \end{subfigure}\hspace{0.04\linewidth}
-    \begin{subfigure}[b]{0.30\linewidth}
+    \begin{subfigure}[b]{0.22\linewidth}
         \centering
         \includegraphics[width=\linewidth]{color64_ffa_final.png}
-        \caption{Color-64 optimized FFA stimulus, FFA $= +0.343$.}
+        \caption{$+0.343$}
         \label{fig:ffa-color-breakdown}
     \end{subfigure}
-    \caption{(a) A frontal portrait of a face, resized to $256\times256$ and tiled to 64 identical frames --- the natural-face reference for the photograph row of Table~\ref{tab:superstim}; predicted FFA activation $+0.080$. (b) Optimized FFA stimulus under \emph{matched gray-64 methodology but with full colour} (single-stage $64\times64$ Fourier spectrum, 3000 steps, global-lift loss, $\lambda_{\text{fft}}=10^{-3}$): predicted FFA activation $+0.343$. Colour expands the optimization parameter space by $3\times$ relative to grayscale, and the optimizer exploits the extra slack to inject high-frequency adversarial texture that drives FFA on top of the face-canonical drive --- visible as the pink/teal tint and high-frequency overlay. The face structure (eyes, nose, mouth) is still recognizable underneath, but the activation number includes an adversarial component the gray-64 result does not (\S\ref{sec:grayscale}).}
+    \caption{Natural face photograph (left, predicted FFA activation $+0.080$) versus the color-64 optimized FFA stimulus (right, predicted FFA activation $+0.343$). The natural face is a frontal portrait resized to $256\times256$ and tiled to 64 identical frames, used as the photograph row of Table~\ref{tab:superstim}. The optimized stimulus uses \emph{matched gray-64 methodology but with full colour} (single-stage $64\times64$ Fourier spectrum, 3000 steps, global-lift loss, $\lambda_{\text{fft}}=10^{-3}$). Colour expands the optimization parameter space by $3\times$ relative to grayscale, and the optimizer exploits the extra slack to inject high-frequency adversarial texture that drives FFA on top of the face-canonical drive --- visible as the pink/teal tint and high-frequency overlay. The face structure (eyes, nose, mouth) is still recognizable underneath, but the activation number includes an adversarial component the gray-64 result does not (\S\ref{sec:grayscale}).}
     \label{fig:face-and-color}
-\end{figure}
+\end{figure*}
 
-The optimized stimulus drives FFA roughly four times harder than the photograph --- the classic feature-visualization super-stimulus phenomenon, where gradient ascent finds patterns that exceed anything in the natural distribution \citep{szegedy2013intriguing,goodfellow2014explaining,walker2019inception,bashivan2019neural}. This does not mean the model is treating our stimulus as a face in any everyday sense; it means the optimizer has found a point in input space that hits V-JEPA 2's FFA-like tuning directions harder than photographs can. Implications for interpretation are discussed in \S\ref{sec:interp-gap}.
+The optimized stimulus drives FFA roughly four times harder than the photograph (the classic feature-visualization super-stimulus phenomenon, in which gradient ascent finds patterns that exceed anything in the natural distribution \citep{szegedy2013intriguing,goodfellow2014explaining,walker2019inception,bashivan2019neural}). This does not mean the model is treating our stimulus as a face in any everyday sense; it means the optimizer has found a point in input space that hits V-JEPA 2's FFA-like tuning directions harder than photographs can.
 
 \section{Ablations}\label{sec:ablations}
 
-We ablate three components of the training recipe (Appendix~\ref{app:ablations}): a low-resolution-first curriculum that improves FFA selectivity ratio from $3.59\times$ to $13.33\times$ by committing the optimizer to global structure before high-frequency degrees of freedom become available; grayscale-only optimization, which gives a comparable raw FFA activation to the colour variant ($0.339$ vs.\ $0.343$) but without the high-frequency adversarial overlay visible in Figure~\ref{fig:face-and-color}b; and a comparison between global lift and targeted suppression of co-activated ROIs, where global lift is simpler and empirically stronger on headline metrics. We adopt gray-64 with global lift for the headline cross-ROI grid because its activation number is a more faithful measure of face-canonical drive.
+We ablate three components of the training recipe (Appendix~\ref{app:ablations}): a low-resolution-first curriculum that improves FFA selectivity ratio from $3.59\times$ to $13.33\times$ by committing the optimizer to global structure before high-frequency degrees of freedom become available; grayscale-only optimization, which gives a comparable raw FFA activation to the colour variant ($0.339$ vs.\ $0.343$) but without the high-frequency adversarial overlay visible in Figure~\ref{fig:face-and-color}b; and a comparison between global lift and targeted suppression of co-activated ROIs, where global lift is simpler and empirically stronger on primary metrics. We adopt gray-64 with global lift for the primary cross-ROI grid because its activation number is a more faithful measure of face-canonical drive.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -213,9 +215,9 @@ We ablate three components of the training recipe (Appendix~\ref{app:ablations})
 \subsection{What the probe tells us about TRIBE v2}
 TRIBE v2 was trained to minimize prediction error on naturalistic video fMRI, without any explicit supervision that FFA should respond to faces, MT to motion, or V1 to edges. Nonetheless, the probe recovers several tuning signatures cleanly at a qualitative level: V1$\to$V4 produces a visible progression of increasing spatial scale and feature complexity up the ventral stream, MT yields implied-motion streaks, and FFA yields face features. This is a stronger claim than prediction accuracy alone supports: the encoder has not merely fit the training fMRI time series, it has recovered the input$\to$region mapping well enough that running the pipeline in reverse reproduces the coarse tuning structure a neuroscientist would expect.
 
-V1, V2, and V3 stimuli sit close together along the progression and cross-activate strongly in Table~\ref{tab:selectivity}. This is consistent with their known tuning overlap --- V2 and V3 inherit feature structure from V1 with incrementally larger receptive fields --- and the probe should be read as tracing a gradient rather than crisply partitioning these regions. The V3 row is diagnostic in the other direction: its stimulus drives V4 (0.251) more strongly than V3 itself (0.179), suggesting V-JEPA~2's features treat V3's tuning as a ``less-V4-y'' variant of V4's rather than as something independent.
+V1, V2, and V3 stimuli sit close together along the progression and cross-activate strongly in Table~\ref{tab:selectivity}. This is consistent with their known tuning overlap --- V2 and V3 inherit feature structure from V1 with incrementally larger receptive fields --- and the probe should be read as tracing a gradient rather than crisply partitioning these regions. The V3 row is diagnostic in the other direction: its stimulus drives V4 (0.251) more strongly than V3 itself (0.179), suggesting V-JEPA~2's features treat V3's tuning as a variant of V4's rather than as something independent.
 
-We deliberately do not push the PPA interpretation beyond ``consistent rectilinear patterns.'' PPA stimuli look like parallel line fields; they do not obviously look like scenes or architecture to us. That the lines are predominantly straight and that PPA is canonically scene-selective is consistent but not in itself strong evidence for a category-level label. Of all seven ROIs, PPA is the one we are least comfortable interpreting --- a useful outcome given that one role of an interpretability probe is to expose where its target encoder is harder to read.
+We deliberately do not push the PPA interpretation beyond ``consistent rectilinear patterns.'' PPA stimuli look like parallel line fields; they do not obviously look like scenes or architecture. That the lines are predominantly straight and that PPA is canonically scene-selective is consistent but not in itself strong evidence for a category-level label. Of all seven ROIs, PPA is the one we are least comfortable interpreting --- a useful outcome given that one role of an interpretability probe is to expose where its target encoder is harder to read.
 
 \subsection{Cross-ROI activation structure}
 \label{sec:discussion-cross-roi}
@@ -247,13 +249,13 @@ Held-out prediction accuracy is a necessary but insufficient evaluation of a bra
 
 \subsection{Low-resolution-first curriculum}
 \label{sec:lowres}
-Progressing through resolutions $64 \to 128 \to 256$ during optimization --- rather than starting at full resolution --- meaningfully improves FFA selectivity: the selectivity ratio (target activation divided by mean activation across all other ROIs) rises from $3.59\times$ at full-resolution start to $13.33\times$ with the low-resolution-first curriculum. The intuition: the optimizer commits to global structure at low resolution before high-frequency degrees of freedom become available to ``cheat'' with pathological texture. We also experimented with the same three-stage curriculum at the headline grayscale setting and found it not obviously better than the single-stage $64\times64$ version on aggregate selectivity; we therefore report single-stage gray-64 as the headline configuration.
+Progressing through resolutions $64 \to 128 \to 256$ during optimization --- rather than starting at full resolution --- meaningfully improves FFA selectivity: the selectivity ratio (target activation divided by mean activation across all other ROIs) rises from $3.59\times$ at full-resolution start to $13.33\times$ with the low-resolution-first curriculum. The intuition: the optimizer commits to global structure at low resolution before high-frequency degrees of freedom become available to ``cheat'' with pathological texture. We also experimented with the same three-stage curriculum at the primary grayscale setting and found it not obviously better than the single-stage $64\times64$ version on aggregate selectivity; we therefore report single-stage gray-64 as the primary configuration.
 
 \subsection{Grayscale-only optimization avoids adversarial high-frequency exploits}
 \label{sec:grayscale}
-Running the full budget at $64\times64$ in pure grayscale with the global lift loss ($\beta=1.0$) gives FFA activation $0.339$ and lift $0.359$, with a simple single-stage training loop. The matched-methodology colour version (\emph{color-64}: same single-stage $64\times64$ Fourier spectrum, same step budget, same loss, just with the colour channels left independent) reaches $0.343$ --- a comparable raw number, but the way it gets there is different. Colour expands the optimization parameter space by $3\times$ (three Fourier channels rather than one), and the optimizer exploits the extra slack to inject high-frequency texture that drives FFA via adversarial directions in V-JEPA~2's feature space rather than purely face-canonical features. The result is the pink/teal-tinted, high-frequency-overlaid image of Figure~\ref{fig:face-and-color}b: face structure recognizable underneath, but adversarially polluted on top. This is the same phenomenon as the low-resolution-first lever in \S\ref{sec:lowres}: restricting the parameter space stops the optimizer from cheating its way to activation. We adopt gray-64 for the headline cross-ROI grid (Figure~\ref{fig:all-rois-grid}) not because the activation number is higher but because that number is a more faithful measure of face-canonical drive.
+Running the full budget at $64\times64$ in pure grayscale with the global lift loss ($\beta=1.0$) gives FFA activation $0.339$ and lift $0.359$, with a simple single-stage training loop. The matched-methodology colour version (\emph{color-64}: same single-stage $64\times64$ Fourier spectrum, same step budget, same loss, just with the colour channels left independent) reaches $0.343$ --- a comparable raw number, but the way it gets there is different. Colour expands the optimization parameter space by $3\times$ (three Fourier channels rather than one), and the optimizer exploits the extra slack to inject high-frequency texture that drives FFA via adversarial directions in V-JEPA~2's feature space rather than purely face-canonical features. The result is the pink/teal-tinted, high-frequency-overlaid image of Figure~\ref{fig:face-and-color}b: face structure recognizable underneath, but adversarially polluted on top. This is the same phenomenon as the low-resolution-first lever in \S\ref{sec:lowres}: restricting the parameter space stops the optimizer from cheating its way to activation. We adopt gray-64 for the primary cross-ROI grid (Figure~\ref{fig:all-rois-grid}) not because the activation number is higher but because that number is a more faithful measure of face-canonical drive.
 
 \subsection{Targeted vs.\ global suppression}
-An earlier experiment used targeted suppression of V4 and MT (the two ROIs most co-activated by naive FFA maximization) with $\beta=0.3$. This gives slightly better suppression of V4 and MT specifically ($0.11$ and $0.05$ vs.\ $0.12$ and $0.19$ in the headline run) but slightly worse target activation ($0.289$ vs.\ $0.339$). Targeted suppression is more principled; global lift is simpler and empirically stronger on headline metrics. Both are defensible depending on what one wants to emphasize.
+An earlier experiment used targeted suppression of V4 and MT (the two ROIs most co-activated by naive FFA maximization) with $\beta=0.3$. This gives slightly better suppression of V4 and MT specifically ($0.11$ and $0.05$ vs.\ $0.12$ and $0.19$ in the primary run) but slightly worse target activation ($0.289$ vs.\ $0.339$). Targeted suppression is more principled; global lift is simpler and empirically stronger on primary metrics. Both are defensible depending on what one wants to emphasize.
 
 \end{document}
